@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>senior_project</name>
+  <version>0.0.1</version>
+  <description>Stretch 2 RL integration with MuJoCo simulation.</description>
+
+  <maintainer email="sbrainard@ltu.edu">sean</maintainer>
+  <license>Apache 2.0</license>
+  
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
