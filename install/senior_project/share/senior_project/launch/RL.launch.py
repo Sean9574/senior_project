@@ -1,19 +1,26 @@
 # RL.launch.py
 #!/usr/bin/env python3
 import os
+import sys
 from pathlib import Path
+from platform import system
 
-from launch.actions import (
-    DeclareLaunchArgument,
-    ExecuteProcess,
-    LogInfo,
-    TimerAction,
-)
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo, TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from launch import LaunchDescription
+
+# Optional: fix QT issues on Linux
+if system() == "Linux":
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = (
+        "/usr/lib/x86_64-linux-gnu/qt5/plugins/platforms"
+    )
+    os.environ["GTK_PATH"] = ""
+
+# Robocasa helpers
+from stretch_mujoco.robocasa_gen import choose_layout, choose_style, get_styles, layouts
 
 
 def generate_launch_description():
@@ -39,7 +46,7 @@ def generate_launch_description():
     ld.add_action(
         DeclareLaunchArgument(
             "use_cameras",
-            default_value="true",
+            default_value="false",
             choices=["true", "false"],
         )
     )
@@ -63,10 +70,10 @@ def generate_launch_description():
             "use_obstacle", default_value="0", choices=["0", "1"]
         )
     )
-    # Dynamic goal topic (matches learner_node.py; with ns=stretch this is /stretch/goal)
+    # Dynamic goal topic (matches learner_node.py)
     ld.add_action(DeclareLaunchArgument("goal_topic", default_value="goal"))
 
-    # --- Evaluation args ---
+    # --- Evaluation args (new) ---
     ld.add_action(
         DeclareLaunchArgument("eval_every_steps", default_value="3000")
     )
@@ -74,7 +81,7 @@ def generate_launch_description():
         DeclareLaunchArgument("eval_episodes", default_value="10")
     )
 
-    # --- Sim args ---
+    # --- Your sim args ---
     ld.add_action(
         DeclareLaunchArgument(
             "broadcast_odom_tf",
@@ -96,12 +103,10 @@ def generate_launch_description():
             choices=["position", "navigation", "trajectory", "gamepad"],
         )
     )
-
-    # Robocasa args kept for compatibility; driver uses use_robocasa=False
     ld.add_action(
         DeclareLaunchArgument(
             "use_robocasa",
-            default_value="false",
+            default_value="true",
             choices=["true", "false"],
         )
     )
@@ -114,36 +119,55 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "robocasa_layout",
             default_value="Random",
+            choices=["Random"] + list(layouts.values()),
         )
     )
     ld.add_action(
         DeclareLaunchArgument(
             "robocasa_style",
             default_value="Random",
+            choices=["Random"] + list(get_styles().values()),
         )
     )
+
+    # --- Optional interactive Robocasa selection ---
+    use_robocasa_flag = "use_robocasa:=false" not in sys.argv
+    robocasa_layout_val = None
+    robocasa_style_val = None
+    if use_robocasa_flag and "--show-args" not in sys.argv:
+        args_string = " ".join(sys.argv)
+        if "robocasa_layout" not in args_string:
+            print("\n\nChoose a Robocasa layout:\n")
+            robocasa_layout_val = layouts[choose_layout()]
+            print(f"{robocasa_layout_val=}")
+        if "robocasa_style" not in args_string:
+            print("\n\nChoose a Robocasa style:\n")
+            robocasa_style_val = get_styles()[choose_style()]
+            print(f"{robocasa_style_val=}")
 
     # --- Load URDF and rewrite mesh paths ---
     robot_description_file = Path(
         "/home/sean/ament_ws/src/stretch_ros2/stretch_description/urdf/stretch.urdf"
     )
 
+    # Path to your mesh folder in the source workspace
     mesh_root = "/home/sean/ament_ws/src/stretch_ros2/stretch_description"
 
+    # Read URDF text
     with open(robot_description_file, "r") as f:
         robot_description_content = f.read()
 
+    # Replace all package:// URIs with file:// absolute paths for meshes
     robot_description_content = robot_description_content.replace(
         "package://stretch_description", f"file://{mesh_root}"
     )
 
-    # Robot state publisher (namespaced; TF frames still global)
+    # Load into robot_state_publisher
     ld.add_action(
         Node(
             package="robot_state_publisher",
             executable="robot_state_publisher",
             name="robot_state_publisher",
-            namespace=LaunchConfiguration("ns"),
             output="both",
             parameters=[
                 {"robot_description": robot_description_content},
@@ -152,14 +176,31 @@ def generate_launch_description():
             arguments=["--ros-args", "--log-level", "error"],
         )
     )
+    robot_description_file = Path(
+        "/home/sean/ament_ws/src/stretch_ros2/stretch_description/urdf/stretch.urdf"
+    )
 
-    # Joint state publisher (namespaced)
+    # Path to your mesh folder in the source workspace
+    mesh_root = "/home/sean/ament_ws/src/stretch_ros2/stretch_description"
+
+    # Read URDF text
+    with open(robot_description_file, "r") as f:
+        robot_description_content = f.read()
+
+    # Replace all package:// URIs with file:// absolute paths for meshes
+    robot_description_content = robot_description_content.replace(
+        "package://stretch_description", f"file://{mesh_root}"
+    )
+
+    # Load into robot_state_publisher
+
+
+    # Joint / Robot state publishers
     ld.add_action(
         Node(
             package="joint_state_publisher",
             executable="joint_state_publisher",
             name="joint_state_publisher",
-            namespace=LaunchConfiguration("ns"),
             output="log",
             parameters=[
                 {"source_list": ["/stretch/joint_states"]},
@@ -169,7 +210,6 @@ def generate_launch_description():
         )
     )
 
-    # RViz (launched normally)
     ld.add_action(
         Node(
             package="rviz2",
@@ -181,19 +221,9 @@ def generate_launch_description():
                 ("/goal_pose", "/goal")
             ],
             condition=IfCondition(LaunchConfiguration("use_rviz")),
+            env=os.environ
         )
     )
-
-    # --- Goal spawner via ExecuteProcess (no libexec / Node needed) ---
-    goal_proc = ExecuteProcess(
-        cmd=[
-            "python3",
-            "-m",
-            "senior_project.goal_spawner",
-        ],
-        output="screen",
-    )
-    ld.add_action(goal_proc)
 
     # MuJoCo driver
     driver_params = [
@@ -207,12 +237,14 @@ def generate_launch_description():
             "mode": LaunchConfiguration("mode"),
             "use_mujoco_viewer": LaunchConfiguration("use_mujoco_viewer"),
             "use_cameras": LaunchConfiguration("use_cameras"),
-
-            # Robocasa off
-            "use_robocasa": False,
+            "use_robocasa": LaunchConfiguration("use_robocasa"),
             "robocasa_task": LaunchConfiguration("robocasa_task"),
-            "robocasa_layout": LaunchConfiguration("robocasa_layout"),
-            "robocasa_style": LaunchConfiguration("robocasa_style"),
+            "robocasa_layout": robocasa_layout_val
+            if robocasa_layout_val is not None
+            else LaunchConfiguration("robocasa_layout"),
+            "robocasa_style": robocasa_style_val
+            if robocasa_style_val is not None
+            else LaunchConfiguration("robocasa_style"),
         }
     ]
     ld.add_action(
@@ -273,7 +305,7 @@ def generate_launch_description():
 
     ld.add_action(
         LogInfo(
-            msg="[RL.launch] Sim + PPO learner + goal_spawner starting."
+            msg="[RL.launch] Sim + PPO learner starting (RL defaults ON)."
         )
     )
     return ld

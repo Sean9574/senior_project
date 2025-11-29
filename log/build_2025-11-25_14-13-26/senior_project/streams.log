@@ -1,0 +1,41 @@
+[0.507s] Invoking command in '/home/sean/ament_ws/src/stretch_ros2/senior_project': PYTHONPATH=/home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base build/senior_project build --build-base /home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/build install --record /home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/install.log --install-scripts $base/lib/<senior_project> --single-version-externally-managed install_data
+[0.700s] running egg_info
+[0.701s] creating build/senior_project/senior_project.egg-info
+[0.701s] writing build/senior_project/senior_project.egg-info/PKG-INFO
+[0.701s] writing dependency_links to build/senior_project/senior_project.egg-info/dependency_links.txt
+[0.701s] writing entry points to build/senior_project/senior_project.egg-info/entry_points.txt
+[0.701s] writing requirements to build/senior_project/senior_project.egg-info/requires.txt
+[0.701s] writing top-level names to build/senior_project/senior_project.egg-info/top_level.txt
+[0.701s] writing manifest file 'build/senior_project/senior_project.egg-info/SOURCES.txt'
+[0.702s] reading manifest file 'build/senior_project/senior_project.egg-info/SOURCES.txt'
+[0.702s] writing manifest file 'build/senior_project/senior_project.egg-info/SOURCES.txt'
+[0.702s] running build
+[0.702s] running build_py
+[0.702s] creating /home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/build
+[0.702s] creating /home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/build/lib
+[0.702s] creating /home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/build/lib/senior_project
+[0.702s] copying senior_project/learner_node.py -> /home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/build/lib/senior_project
+[0.702s] copying senior_project/__init__.py -> /home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/build/lib/senior_project
+[0.702s] running install
+[0.703s] running install_lib
+[0.703s] creating /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/lib/python3.10/site-packages/senior_project
+[0.703s] copying /home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/build/lib/senior_project/learner_node.py -> /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/lib/python3.10/site-packages/senior_project
+[0.703s] copying /home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/build/lib/senior_project/__init__.py -> /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/lib/python3.10/site-packages/senior_project
+[0.703s] byte-compiling /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/lib/python3.10/site-packages/senior_project/learner_node.py to learner_node.cpython-310.pyc
+[0.707s] byte-compiling /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/lib/python3.10/site-packages/senior_project/__init__.py to __init__.cpython-310.pyc
+[0.707s] running install_data
+[0.707s] creating /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/share/ament_index
+[0.707s] creating /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/share/ament_index/resource_index
+[0.707s] creating /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/share/ament_index/resource_index/packages
+[0.707s] copying resource/senior_project -> /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/share/ament_index/resource_index/packages
+[0.707s] copying package.xml -> /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/share/senior_project
+[0.707s] creating /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/share/senior_project/launch
+[0.707s] copying launch/RL.launch.py -> /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/share/senior_project/launch
+[0.707s] copying launch/launch_sim.launch.py -> /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/share/senior_project/launch
+[0.707s] creating /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/share/senior_project/modules
+[0.707s] creating /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/share/senior_project/scripts
+[0.707s] running install_egg_info
+[0.708s] Copying build/senior_project/senior_project.egg-info to /home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/lib/python3.10/site-packages/senior_project-0.0.1-py3.10.egg-info
+[0.709s] running install_scripts
+[0.721s] writing list of installed files to '/home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/install.log'
+[0.734s] Invoked command in '/home/sean/ament_ws/src/stretch_ros2/senior_project' returned '0': PYTHONPATH=/home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/sean/ament_ws/src/stretch_ros2/senior_project/install/senior_project/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base build/senior_project build --build-base /home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/build install --record /home/sean/ament_ws/src/stretch_ros2/senior_project/build/senior_project/install.log --install-scripts $base/lib/<senior_project> --single-version-externally-managed install_data
