@@ -101,7 +101,7 @@ def generate_launch_description():
     ld.add_action(
         DeclareLaunchArgument(
             "use_robocasa",
-            default_value="false",
+            default_value="true",
             choices=["true", "false"],
         )
     )

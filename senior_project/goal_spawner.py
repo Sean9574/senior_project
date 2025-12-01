@@ -5,14 +5,21 @@ import random
 import rclpy
 from geometry_msgs.msg import PointStamped
 from rclpy.node import Node
+from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker
 
 
 class GoalSpawner(Node):
     """
-    Spawns a random goal and publishes it continuously on:
+    Spawns a goal and publishes it continuously on:
       /stretch/goal         (PointStamped)
       /stretch/goal_marker  (Marker, sphere) for RViz visualization
+
+    Features:
+      - Random goals (sampled on node start and whenever the
+        /stretch/new_random_goal service is called).
+      - Manual override: if you publish to /stretch/manual_goal, that
+        goal overrides the random one until a new random goal is requested.
     """
 
     def __init__(self):
@@ -50,17 +57,42 @@ class GoalSpawner(Node):
         self.goal_pub = self.create_publisher(PointStamped, "/stretch/goal", 10)
         self.marker_pub = self.create_publisher(Marker, "/stretch/goal_marker", 10)
 
-        # Sample one goal
-        self.goal_x, self.goal_y = self._sample_goal()
-      
+        # Manual override state
+        self.manual_override = False
+        self.manual_goal_msg = None
 
-        # Pre-create msgs that we’ll republish continuously
+        # Subscriber for manual goals
+        self.manual_goal_sub = self.create_subscription(
+            PointStamped,
+            "/stretch/manual_goal",
+            self._manual_goal_cb,
+            10,
+        )
+
+        # Service to request a new random goal (clears manual override)
+        self.new_random_srv = self.create_service(
+            Trigger,
+            "/stretch/new_random_goal",
+            self._handle_new_random_goal,
+        )
+
+        # Initial random goal
+        self.goal_x, self.goal_y = self._sample_goal()
+        self.get_logger().info(
+            f"Initial random goal at x={self.goal_x:.2f}, y={self.goal_y:.2f} "
+            f"in frame '{self.frame_id}'"
+        )
+
+        # Pre-create msgs for the current random goal
         self.goal_msg = self._make_goal_msg(self.goal_x, self.goal_y)
         self.marker_msg = self._make_marker_msg(self.goal_x, self.goal_y)
 
         # Timer: publish forever at publish_period
         self.timer = self.create_timer(self.publish_period, self._timer_cb)
 
+    # -----------------------
+    #  Goal sampling & msgs
+    # -----------------------
     def _sample_goal(self):
         r = random.uniform(self.min_radius, self.max_radius)
         angle_deg = random.uniform(self.min_angle_deg, self.max_angle_deg)
@@ -109,13 +141,68 @@ class GoalSpawner(Node):
         m.lifetime.nanosec = 0
         return m
 
+    # -----------------------
+    #  Manual goal override
+    # -----------------------
+    def _manual_goal_cb(self, msg: PointStamped):
+        # Ensure frame is set; if not, force to our frame_id
+        if not msg.header.frame_id:
+            msg.header.frame_id = self.frame_id
+
+        self.manual_goal_msg = msg
+        self.manual_override = True
+
+        # Update marker to match manual goal
+        x = float(msg.point.x)
+        y = float(msg.point.y)
+        self.marker_msg = self._make_marker_msg(x, y)
+
+        self.get_logger().info(
+            f"Manual goal override set to x={x:.2f}, y={y:.2f} "
+            f"in frame '{msg.header.frame_id}'"
+        )
+
+    # -----------------------
+    #  Service: new random goal
+    # -----------------------
+    def _handle_new_random_goal(self, request, response):
+        # Sample a new random goal
+        self.goal_x, self.goal_y = self._sample_goal()
+        self.goal_msg = self._make_goal_msg(self.goal_x, self.goal_y)
+        self.marker_msg = self._make_marker_msg(self.goal_x, self.goal_y)
+
+        # Clear manual override
+        self.manual_override = False
+        self.manual_goal_msg = None
+
+        response.success = True
+        response.message = (
+            f"New random goal at x={self.goal_x:.2f}, y={self.goal_y:.2f} "
+            f"in frame '{self.frame_id}'. Manual override cleared."
+        )
+        self.get_logger().info(response.message)
+        return response
+
+    # -----------------------
+    #  Timer callback
+    # -----------------------
     def _timer_cb(self):
         now = self.get_clock().now().to_msg()
-        self.goal_msg.header.stamp = now
-        self.marker_msg.header.stamp = now
 
-        self.goal_pub.publish(self.goal_msg)
-        self.marker_pub.publish(self.marker_msg)
+        if self.manual_override and self.manual_goal_msg is not None:
+            # Publish manual goal + marker
+            self.manual_goal_msg.header.stamp = now
+            self.marker_msg.header.stamp = now
+
+            self.goal_pub.publish(self.manual_goal_msg)
+            self.marker_pub.publish(self.marker_msg)
+        else:
+            # Publish random goal + marker
+            self.goal_msg.header.stamp = now
+            self.marker_msg.header.stamp = now
+
+            self.goal_pub.publish(self.goal_msg)
+            self.marker_pub.publish(self.marker_msg)
 
 
 def main(args=None):
