@@ -25,7 +25,6 @@ setup(
     entry_points={
         'console_scripts': [
             'learner_node = senior_project.learner_node:main',
-            'goal_spawner = senior_project.goal_spawner:main',
             
         ],
     },

@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
-
 import math
+import os
 import subprocess
 import time
 from typing import Optional, Tuple
@@ -15,23 +14,17 @@ from gymnasium import spaces
 from nav_msgs.msg import Odometry
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import Imu, LaserScan
-
-# skrl imports
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
 from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 from skrl.trainers.torch import SequentialTrainer
 from std_msgs.msg import Float32
-from std_srvs.srv import Empty
+from std_srvs.srv import Trigger
+from visualization_msgs.msg import Marker
 
-# TensorBoard
-from torch.utils.tensorboard import SummaryWriter
-
-# ----------------------------
-# Helpers
-# ----------------------------
 
 def yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
     """Compute yaw from quaternion (ROS convention)."""
@@ -40,46 +33,34 @@ def yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
-# ----------------------------
-# ROS node wrapper
-# ----------------------------
-
 class StretchRosInterface(Node):
     """ROS2 node that holds the latest sensor messages and publishes cmd_vel."""
 
-    def __init__(self):
+    def __init__(self, fixed_goal_x: float = 3.0, fixed_goal_y: float = 0.0):
         super().__init__("skrl")
 
-        # Subscriptions
         self.last_odom: Optional[Odometry] = None
         self.last_scan: Optional[LaserScan] = None
         self.last_goal: Optional[PointStamped] = None
         self.last_imu: Optional[Imu] = None
 
-        self.create_subscription(
-            Odometry, "/stretch/odom", self._odom_cb, 10
-        )
-        self.create_subscription(
-            LaserScan, "/stretch/scan", self._scan_cb, 10
-        )
-        self.create_subscription(
-            PointStamped, "/stretch/goal", self._goal_cb, 10
-        )
-        self.create_subscription(
-            Imu, "/stretch/imu", self._imu_cb, 10
-        )
+        self.create_subscription(Odometry, "/stretch/odom", self._odom_cb, 10)
+        self.create_subscription(LaserScan, "/stretch/scan", self._scan_cb, 10)
+        self.create_subscription(PointStamped, "/stretch/goal", self._goal_cb, 10)
+        self.create_subscription(Imu, "/stretch/imu", self._imu_cb, 10)
 
-        # Publisher
         self.cmd_pub = self.create_publisher(Twist, "/stretch/cmd_vel", 10)
+        self.goal_pub = self.create_publisher(PointStamped, "/stretch/goal", 10)
+        self.goal_marker_pub = self.create_publisher(Marker, "/stretch/goal_marker", 10)
 
-        # Reset service client (optional – currently unused)
-        self.reset_client = self.create_client(Empty, "reset_sim")
-        if not self.reset_client.service_is_ready():
-            self.get_logger().warn(
-                "[SKRL_ENV] reset_sim service not ready (soft resets only)"
-            )
+        self.reset_client = self.create_client(Trigger, "reset_sim")
 
-    # --- callbacks ---
+        # FIXED GOAL - same position every episode
+        self.FIXED_GOAL_X = fixed_goal_x
+        self.FIXED_GOAL_Y = fixed_goal_y
+        
+        self.get_logger().info(f"[GOAL] Using FIXED goal at ({self.FIXED_GOAL_X}, {self.FIXED_GOAL_Y})")
+
     def _odom_cb(self, msg: Odometry):
         self.last_odom = msg
 
@@ -92,67 +73,135 @@ class StretchRosInterface(Node):
     def _imu_cb(self, msg: Imu):
         self.last_imu = msg
 
-    # --- helper methods ---
     def wait_for_sensors(self, timeout_sec: float = 5.0) -> bool:
-        """Wait for at least one message on odom, scan, goal."""
+        """Initial startup wait."""
         start = time.time()
         while time.time() - start < timeout_sec:
             if (
                 self.last_odom is not None
                 and self.last_scan is not None
-                and self.last_goal is not None
             ):
                 return True
             rclpy.spin_once(self, timeout_sec=0.1)
-        self.get_logger().warn("[SKRL_ENV] Timeout waiting for odom/scan/goal")
+        self.get_logger().warn("[SKRL_ENV] Timeout waiting for initial sensors")
+        return False
+
+    def wait_for_fresh_sensors(self, reset_time_ns: int, timeout_sec: float = 5.0) -> bool:
+        """
+        CRITICAL FIX: Spin until we get odom and scan messages 
+        strictly NEWER than reset_time_ns.
+        """
+        start = time.time()
+        fresh_odom = False
+        fresh_scan = False
+
+        while time.time() - start < timeout_sec:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            
+            # Check Odom freshness
+            if self.last_odom is not None:
+                msg_time = Time.from_msg(self.last_odom.header.stamp).nanoseconds
+                if msg_time > reset_time_ns:
+                    fresh_odom = True
+            
+            # Check Scan freshness
+            if self.last_scan is not None:
+                msg_time = Time.from_msg(self.last_scan.header.stamp).nanoseconds
+                if msg_time > reset_time_ns:
+                    fresh_scan = True
+
+            if fresh_odom and fresh_scan:
+                return True
+                
+        self.get_logger().warn(f"[RESET] Timeout waiting for FRESH sensors (>{reset_time_ns})")
         return False
 
     def send_cmd(self, v: float, w: float):
-        """Publish cmd_vel.
-
-        NOTE: in this setup, forward is -x on the robot.
-        So v > 0 => cmd_vel.linear.x < 0 (forward motion).
-        """
         msg = Twist()
-        msg.linear.x = -float(v)
+        msg.linear.x = float(v)
         msg.angular.z = float(w)
         self.cmd_pub.publish(msg)
 
-    def call_reset(self, timeout_sec: float = 2.0) -> bool:
-        """Call /reset_sim if available."""
+    def _get_robot_pose(self) -> Tuple[float, float, float]:
+        if self.last_odom is None:
+            return 0.0, 0.0, 0.0
+        rx = self.last_odom.pose.pose.position.x
+        ry = self.last_odom.pose.pose.position.y
+        q = self.last_odom.pose.pose.orientation
+        yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
+        return rx, ry, yaw
+
+    def publish_fixed_goal(self):
+        """Publish the FIXED goal position (same every episode)."""
+        rx, ry, _ = self._get_robot_pose()
+        
+        goal_x = self.FIXED_GOAL_X
+        goal_y = self.FIXED_GOAL_Y
+
+        goal_msg = PointStamped()
+        goal_msg.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.header.frame_id = "odom"
+        goal_msg.point.x = goal_x
+        goal_msg.point.y = goal_y
+        goal_msg.point.z = 0.0
+
+        self.goal_pub.publish(goal_msg)
+        self.last_goal = goal_msg
+        self._publish_goal_marker(goal_x, goal_y)
+
+    def _publish_goal_marker(self, goal_x: float, goal_y: float):
+        marker = Marker()
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.header.frame_id = "odom"
+        marker.ns = "goal"
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = goal_x
+        marker.pose.position.y = goal_y
+        marker.pose.position.z = 0.3
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.6
+        marker.scale.y = 0.6
+        marker.scale.z = 0.6
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 0.8
+        marker.lifetime.sec = 0
+        marker.lifetime.nanosec = 0
+        self.goal_marker_pub.publish(marker)
+
+    def call_reset(self, timeout_sec: float = 3.0) -> bool:
         if not self.reset_client.service_is_ready():
-            self.get_logger().warn(
-                "[SKRL_ENV] reset_sim service not ready, skipping"
-            )
+            self.get_logger().warn("[SKRL_ENV] reset_sim service not ready")
             return False
-        req = Empty.Request()
-        future = self.reset_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
-        if future.done():
-            self.get_logger().info("[SKRL_ENV] reset_sim service call returned")
-            return True
-        self.get_logger().warn("[SKRL_ENV] reset_sim service call timed out")
-        return False
 
+        try:
+            req = Trigger.Request()
+            future = self.reset_client.call_async(req)
 
-# ----------------------------
-# Gym environment
-# ----------------------------
+            start_time = time.time()
+            while not future.done():
+                if time.time() - start_time > timeout_sec:
+                    self.get_logger().warn("[SKRL_ENV] reset_sim service call timed out")
+                    return False
+                rclpy.spin_once(self, timeout_sec=0.1)
+
+            if future.exception():
+                self.get_logger().error(f"[SKRL_ENV] reset_sim failed: {future.exception()}")
+                return False
+
+            response = future.result()
+            return response.success
+
+        except Exception as e:
+            self.get_logger().error(f"[SKRL_ENV] Exception calling reset_sim: {e}")
+            return False
+
 
 class StretchRosEnv(gym.Env):
-    """Gym-style environment that uses ROS2 topics to control the Stretch robot in MuJoCo.
-
-    Observation:
-      - num_lidar_bins lidar bins (min range in each angular sector)
-      - goal_dx, goal_dy in odom frame
-      - robot linear velocity (x) and angular velocity (z)
-
-    Action:
-      - 2D continuous vector in [-1, 1]: [linear_cmd, angular_cmd]
-        mapped to:
-          linear.x in [-max_lin_vel, max_lin_vel]
-          angular.z in [-max_ang_vel, max_ang_vel]
-    """
+    """Gym-style environment that uses ROS2 topics to control the Stretch robot."""
 
     metadata = {"render_modes": []}
 
@@ -164,27 +213,19 @@ class StretchRosEnv(gym.Env):
         num_lidar_bins: int = 60,
         collision_dist: float = 0.3,
         goal_radius: float = 0.3,
-        max_goal_distance: float = 5.0,
-        min_safe_distance: float = 0.5,
-        writer: Optional[SummaryWriter] = None,
+        episode_time_seconds: float = 30.0,
+        fixed_goal_x: float = 3.0,
+        fixed_goal_y: float = 0.0,
     ):
         super().__init__()
 
-        # ROS setup (one node + executor)
         rclpy.init(args=None)
-        self.ros_node = StretchRosInterface()
+        self.ros_node = StretchRosInterface(fixed_goal_x=fixed_goal_x, fixed_goal_y=fixed_goal_y)
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.ros_node)
 
-        # Reward publisher
-        self.reward_pub = self.ros_node.create_publisher(
-            Float32, "/stretch/reward", 10
-        )
+        self.reward_pub = self.ros_node.create_publisher(Float32, "/stretch/reward", 10)
 
-        # TensorBoard writer (can be None)
-        self.writer = writer
-
-        # Env parameters
         self.max_lin_vel = max_lin_vel
         self.max_ang_vel = max_ang_vel
         self.control_dt = control_dt
@@ -192,151 +233,112 @@ class StretchRosEnv(gym.Env):
         self.collision_dist = collision_dist
         self.goal_radius = goal_radius
 
-        # Distance / shaping
-        self.max_goal_distance = max_goal_distance
-        self.min_safe_distance = max(min_safe_distance, collision_dist + 0.05)
-
-        # RL episode settings
         self.prev_goal_dist: float = 0.0
         self.step_count = 0
-        self.max_steps_per_episode = int(
-            30.0 / control_dt
-        )  # ~30 seconds per episode
+        self.max_steps_per_episode = int(episode_time_seconds / control_dt)
 
-        # Progress-based reward parameters (stronger now)
-        self.alpha_target = 20.0        # weight for progress term (was 10.0)
-        self.progress_deadband = 0.005  # meters
+        # Reward parameters
+        self.alpha_target = 20.0
+        self.progress_deadband = 0.001
+        self.movement_scale = 0.2
+        self.obstacle_scale = 3.0
+        self.obstacle_gradient_start = 1.0
+        self.mu_goal = 60
+        self.mu_fail = -30
 
-        # Movement reward scaling (forward-only; stronger now)
-        self.movement_scale = 0.1       # was 0.05
-
-        # Obstacle gradient punishment
-        self.obstacle_scale = 3.0       # per-step penalty when inside min_safe_distance
-
-        # Terminal rewards
-        self.mu_goal = 80.0             # success reward (was 50.0)
-        self.mu_fail = -60.0            # failure penalty (slightly stronger than before)
-
-        # Episode statistics for summaries
         self.episode_return = 0.0
         self.episode_length = 0
         self.episode_index = 0
+        self.total_successes = 0
+        self.total_collisions = 0
+        self.total_timeouts = 0
+        self._initialized = False
 
-        # Action: [linear_cmd, angular_cmd] in [-1, 1]
         self.action_space = spaces.Box(
             low=np.array([-1.0, -1.0], dtype=np.float32),
             high=np.array([1.0, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
 
-        # Observation: lidar bins + 2 goal + 2 velocities
-        obs_dim = self.num_lidar_bins + 4
+        obs_dim = self.num_lidar_bins + 6
         self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(obs_dim,),
-            dtype=np.float32,
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32,
         )
 
-    # -------- Gym API methods --------
-
-    def reset(
-        self,
-        *,
-        seed: Optional[int] = None,
-        options: Optional[dict] = None,
-    ):
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
 
-        # Stop robot
-        self.ros_node.send_cmd(0.0, 0.0)
+        if not self._initialized:
+            self.ros_node.get_logger().info("[RESET] First reset - waiting for sensors...")
+            self.ros_node.wait_for_sensors(timeout_sec=10.0)
+            self._initialized = True
 
-        # Reset step counter and episode stats for new episode
+        # 1. Stop Robot before reset (prevents physics glitches)
+        self.ros_node.send_cmd(0.0, 0.0)
+        for _ in range(5):
+            rclpy.spin_once(self.ros_node, timeout_sec=0.01)
+
+        # 2. Capture Time BEFORE calling reset service
+        reset_req_time = self.ros_node.get_clock().now().nanoseconds
+
+        # 3. Call Reset
+        reset_success = self.ros_node.call_reset(timeout_sec=5.0)
+        if not reset_success:
+            self.ros_node.get_logger().warn("[RESET] Service failed. Retrying soft reset...")
+
+        # 4. Wait for FRESH sensors (Timestamp Handshake)
+        sensors_ready = self.ros_node.wait_for_fresh_sensors(reset_req_time, timeout_sec=5.0)
+        
+        if not sensors_ready:
+             self.ros_node.get_logger().error("[RESET] FAILED to sync fresh sensors! Observation may be stale.")
+
+        # 5. Publish Goal and set state
+        self.ros_node.publish_fixed_goal()
+        
+        rclpy.spin_once(self.ros_node, timeout_sec=0.05)
+
         self.step_count = 0
         self.episode_return = 0.0
         self.episode_length = 0
 
-        # Wait for sensors
-        self.ros_node.wait_for_sensors(timeout_sec=5.0)
-
-        # Build initial obs and distance
         obs = self._build_observation()
         self.prev_goal_dist = self._goal_distance()
 
-        info = {}
-        return obs, info
+        return obs, {"goal_distance": self.prev_goal_dist}
 
     def step(self, action: np.ndarray):
-        # Clip action
-        action = np.clip(
-            action, self.action_space.low, self.action_space.high
-        )
+        action = np.clip(action, self.action_space.low, self.action_space.high)
         v_cmd = float(action[0]) * self.max_lin_vel
         w_cmd = float(action[1]) * self.max_ang_vel
 
-        # Send cmd to ROS
         self.ros_node.send_cmd(v_cmd, w_cmd)
 
-        # Spin ROS a bit to get new data
         t_end = time.time() + self.control_dt
         while time.time() < t_end:
             rclpy.spin_once(self.ros_node, timeout_sec=0.01)
 
-        # Build obs and compute reward + breakdown
         obs = self._build_observation()
         reward, terminated, collided, terms = self._compute_reward_done()
 
-        # Update per-episode stats
         self.episode_return += float(reward)
         self.episode_length += 1
 
-        # Publish reward for rqt_plot / logging
         self.reward_pub.publish(Float32(data=float(reward)))
-
-        # Per-step reward log (compact)
-        self.ros_node.get_logger().info(
-            "[REWARD] total={:+6.2f} | prog={:+6.2f} move={:+6.2f} "
-            "obs={:+6.2f} goal={:+6.2f} fail={:+6.2f}"
-            .format(
-                reward,
-                terms["progress"],
-                terms["movement"],
-                terms["obstacle"],
-                terms["goal"],
-                terms["fail"],
-            )
-        )
 
         self.step_count += 1
         truncated = self.step_count >= self.max_steps_per_episode
 
-        # If episode ended, log a summary and send to TensorBoard
         if terminated or truncated:
             success = (terms["goal"] != 0.0)
-
+            status = "✓ SUCCESS" if success else ("✗ COLLISION" if collided else "⊗ TIMEOUT")
             self.ros_node.get_logger().info(
-                "[EPISODE] idx={} return={:+7.2f} length={} success={}".format(
-                    self.episode_index,
-                    self.episode_return,
-                    self.episode_length,
-                    success,
-                )
+                f"[EP {self.episode_index:04d}] {status} | "
+                f"Return: {self.episode_return:+7.1f} | "
+                f"Steps: {self.episode_length:3d} | "
+                f"Final Dist: {self._goal_distance():.2f}m | "
+                f"S/C/T: {self.total_successes}/{self.total_collisions}/{self.total_timeouts}"
             )
 
-            if self.writer is not None:
-                self.writer.add_scalar(
-                    "Episode/Return", self.episode_return, self.episode_index
-                )
-                self.writer.add_scalar(
-                    "Episode/Length", self.episode_length, self.episode_index
-                )
-                self.writer.add_scalar(
-                    "Episode/Success",
-                    1.0 if success else 0.0,
-                    self.episode_index,
-                )
-
-            # Prepare for next episode stats
             self.episode_index += 1
             self.episode_return = 0.0
             self.episode_length = 0
@@ -350,17 +352,29 @@ class StretchRosEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def close(self):
-        self.ros_node.send_cmd(0.0, 0.0)
-        self.executor.shutdown()
-        self.ros_node.destroy_node()
-        rclpy.shutdown()
-        if self.writer is not None:
-            self.writer.close()
-
-    # -------- Observation helpers --------
+        try:
+            if rclpy.ok():
+                self.ros_node.send_cmd(0.0, 0.0)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'executor'):
+                self.executor.shutdown()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'ros_node'):
+                self.ros_node.destroy_node()
+        except Exception:
+            pass
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
     def _build_observation(self) -> np.ndarray:
-        """Build observation vector from latest ROS messages."""
+        """Build observation with ENHANCED goal representation."""
         odom = self.ros_node.last_odom
         scan = self.ros_node.last_scan
         goal = self.ros_node.last_goal
@@ -371,38 +385,50 @@ class StretchRosEnv(gym.Env):
             scan = self.ros_node.last_scan
             goal = self.ros_node.last_goal
             if odom is None or scan is None or goal is None:
-                return np.zeros(
-                    self.observation_space.shape, dtype=np.float32
-                )
+                return np.zeros(self.observation_space.shape, dtype=np.float32)
 
         lidar_bins = self._lidar_to_bins(scan)
 
+        # Goal position
         gx = goal.point.x
         gy = goal.point.y
         rx = odom.pose.pose.position.x
         ry = odom.pose.pose.position.y
+        
+        # Robot orientation
+        q = odom.pose.pose.orientation
+        robot_yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
+        
+        # Goal in Cartesian coordinates (relative to robot)
         goal_dx = gx - rx
         goal_dy = gy - ry
+        
+        # Goal in Polar coordinates
+        goal_distance = math.hypot(goal_dx, goal_dy)
+        goal_angle_world = math.atan2(goal_dy, goal_dx)
+        goal_angle_relative = goal_angle_world - robot_yaw
+        # Normalize angle to [-pi, pi]
+        goal_angle_relative = math.atan2(math.sin(goal_angle_relative), math.cos(goal_angle_relative))
 
+        # Velocities
         v_lin = odom.twist.twist.linear.x
         v_ang = odom.twist.twist.angular.z
 
-        obs = np.concatenate(
-            [
-                lidar_bins,
-                np.array(
-                    [goal_dx, goal_dy, v_lin, v_ang], dtype=np.float32
-                ),
-            ],
-            axis=0,
-        ).astype(np.float32)
+        # ENHANCED OBSERVATION: 60 lidar + 6 goal features
+        obs = np.concatenate([
+            lidar_bins,  # 60 values
+            np.array([
+                goal_dx,              # Cartesian X offset
+                goal_dy,              # Cartesian Y offset  
+                goal_distance,        # Polar distance
+                goal_angle_relative,  # Polar angle (relative to robot heading)
+                v_lin,                # Linear velocity
+                v_ang                 # Angular velocity
+            ], dtype=np.float32),
+        ], axis=0).astype(np.float32)
         return obs
 
     def _lidar_to_bins(self, scan: LaserScan) -> np.ndarray:
-        """Convert full LaserScan to num_lidar_bins using min range per sector.
-
-        IMPORTANT: treat 0 / NaN / inf as 'no return', not as collision.
-        """
         ranges = np.array(scan.ranges, dtype=np.float32)
         max_range = scan.range_max
 
@@ -421,7 +447,6 @@ class StretchRosEnv(gym.Env):
         return bins
 
     def _goal_distance(self) -> float:
-        """Euclidean distance from robot base to goal in odom frame."""
         odom = self.ros_node.last_odom
         goal = self.ros_node.last_goal
         if odom is None or goal is None:
@@ -433,7 +458,6 @@ class StretchRosEnv(gym.Env):
         return float(math.hypot(gx - rx, gy - ry))
 
     def _min_front_lidar(self, num_front_bins: int = 4) -> float:
-        """Min lidar range in the front sector."""
         scan = self.ros_node.last_scan
         if scan is None:
             return float("inf")
@@ -445,58 +469,44 @@ class StretchRosEnv(gym.Env):
             return float("inf")
         return float(np.min(bins[start:end]))
 
-    # -------- Progress + movement + obstacle reward --------
+    def _min_all_lidar(self) -> float:
+        scan = self.ros_node.last_scan
+        if scan is None:
+            return float("inf")
+        bins = self._lidar_to_bins(scan)
+        return float(np.min(bins))
 
     def _compute_reward_done(self) -> Tuple[float, bool, bool, dict]:
-        """Reward based on:
-           - positive progress toward goal
-           - positive reward for forward motion
-           - gradient negative reward near obstacles
-           - big bonus on goal
-           - big penalty on collision or timeout
-        """
         terminated = False
         collided = False
 
         d_goal = self._goal_distance()
         min_front = self._min_front_lidar()
+        min_all = self._min_all_lidar()
         odom = self.ros_node.last_odom
-        goal = self.ros_node.last_goal
 
-        # Debug: print robot and goal pose + distance
-        if odom is not None and goal is not None:
-            rx = odom.pose.pose.position.x
-            ry = odom.pose.pose.position.y
-            gx = goal.point.x
-            gy = goal.point.y
-            self.ros_node.get_logger().info(
-                f"[GOAL_DEBUG] robot=({rx:.2f}, {ry:.2f})  "
-                f"goal=({gx:.2f}, {gy:.2f})  d_goal={d_goal:.3f}"
-            )
-
-        # --- PROGRESS reward ---
-        raw_progress = self.prev_goal_dist - d_goal  # >0 closer, <0 farther
+        # Progress reward - main driving signal
+        raw_progress = self.prev_goal_dist - d_goal
         if abs(raw_progress) > self.progress_deadband:
             r_progress = self.alpha_target * raw_progress
         else:
             r_progress = 0.0
 
-        # --- MOVEMENT reward (encourage forward motion; forward is -x) ---
+        # Movement reward - encourage forward motion
         r_movement = 0.0
         if odom is not None:
-            v_lin = odom.twist.twist.linear.x  # forward is negative
-            if v_lin < -0.01:  # moving forward
-                r_movement = self.movement_scale * (-v_lin)
+            v_lin = odom.twist.twist.linear.x
+            if v_lin > 0.01:
+                r_movement = self.movement_scale * v_lin
 
-        # --- OBSTACLE gradient punishment ---
+        # Obstacle avoidance - gradient penalty
         r_obstacle = 0.0
-        if min_front < self.min_safe_distance:
-            # closeness in [0, min_safe_distance], normalized to [0,1]
-            closeness = max(0.0, self.min_safe_distance - min_front)
-            frac = closeness / max(self.min_safe_distance, 1e-6)
-            r_obstacle = -self.obstacle_scale * frac
+        if min_all < self.obstacle_gradient_start:
+            closeness = (self.obstacle_gradient_start - min_all) / (self.obstacle_gradient_start - self.collision_dist)
+            closeness = np.clip(closeness, 0.0, 1.0)
+            r_obstacle = -self.obstacle_scale * (closeness ** 2)
 
-        # --- FAILURE conditions ---
+        # Terminal conditions
         collision = min_front < self.collision_dist
         timeout = (self.step_count + 1) >= self.max_steps_per_episode
 
@@ -504,29 +514,27 @@ class StretchRosEnv(gym.Env):
         r_fail = 0.0
 
         if d_goal < self.goal_radius:
-            # SUCCESS
             r_goal = self.mu_goal
             terminated = True
+            self.total_successes += 1
+            self.ros_node.get_logger().info(f"[SUCCESS] Reached goal! Distance: {d_goal:.3f}m")
 
         elif collision or timeout:
-            # FAILURE
             r_fail = self.mu_fail
             terminated = True
             collided = collision
+
             if collision:
+                self.total_collisions += 1
                 self.ros_node.get_logger().info(
-                    f"[FAIL] collision: min_front={min_front:.3f} < "
-                    f"{self.collision_dist:.3f}"
+                    f"[COLLISION] min_front={min_front:.3f} < {self.collision_dist:.3f}"
                 )
             elif timeout:
-                self.ros_node.get_logger().info(
-                    f"[FAIL] timeout at step {self.step_count + 1}"
-                )
+                self.total_timeouts += 1
+                self.ros_node.get_logger().info(f"[TIMEOUT] at step {self.step_count + 1}")
 
-        # Total reward
+        # Total reward - REMOVED conflicting distance reward
         reward = r_progress + r_movement + r_obstacle + r_goal + r_fail
-
-        # Update distance for next step
         self.prev_goal_dist = d_goal
 
         terms = {
@@ -540,33 +548,17 @@ class StretchRosEnv(gym.Env):
         return float(reward), terminated, collided, terms
 
 
-# ----------------------------
-# skrl Models (policy & value)
-# ----------------------------
-
 class Policy(GaussianMixin, Model):
-    """Gaussian policy model for continuous actions."""
-
+    """Policy network - 66 inputs (60 lidar + 6 goal features)."""
+    
     def __init__(
-        self,
-        observation_space,
-        action_space,
-        device,
-        clip_actions: bool = False,
-        clip_log_std: bool = True,
-        min_log_std: float = -20,
-        max_log_std: float = 2,
+        self, observation_space, action_space, device,
+        clip_actions: bool = False, clip_log_std: bool = True,
+        min_log_std: float = -20, max_log_std: float = 2,
         reduction: str = "sum",
     ):
         Model.__init__(self, observation_space, action_space, device)
-        GaussianMixin.__init__(
-            self,
-            clip_actions,
-            clip_log_std,
-            min_log_std,
-            max_log_std,
-            reduction,
-        )
+        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, reduction)
 
         self.net = nn.Sequential(
             nn.Linear(self.num_observations, 128),
@@ -575,9 +567,8 @@ class Policy(GaussianMixin, Model):
             nn.ReLU(),
             nn.Linear(128, self.num_actions),
         )
-        self.log_std_parameter = nn.Parameter(
-            torch.zeros(self.num_actions)
-        )
+        
+        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
 
     def compute(self, inputs, role):
         mean = self.net(inputs["states"])
@@ -585,15 +576,9 @@ class Policy(GaussianMixin, Model):
 
 
 class Value(DeterministicMixin, Model):
-    """Deterministic value function model."""
-
-    def __init__(
-        self,
-        observation_space,
-        action_space,
-        device,
-        clip_actions: bool = False,
-    ):
+    """Value network - 66 inputs (60 lidar + 6 goal features)."""
+    
+    def __init__(self, observation_space, action_space, device, clip_actions: bool = False):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions)
 
@@ -610,81 +595,82 @@ class Value(DeterministicMixin, Model):
         return value, {}
 
 
-# ----------------------------
-# Simple skrl PPO setup
-# ----------------------------
-
 def main():
-    # TensorBoard writer with a fresh logdir (new run)
-    writer = SummaryWriter(log_dir="runs/stretch_nav_v3")
-
-    # Optionally auto-start TensorBoard on port 6006
-    subprocess.Popen(
-        ["tensorboard", "--logdir", "runs", "--port", "6006"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+  
+    print("\nInitializing environment...")
+    base_env = StretchRosEnv(
+        max_lin_vel=1.0, 
+        episode_time_seconds=15,
+        fixed_goal_x=3.0,
+        fixed_goal_y=0.0,
     )
-    print("TensorBoard started at http://localhost:6006 (using runs/stretch_nav_v3)")
-
-    # Create ROS-based env and wrap for skrl
-    # Increase speed here via max_lin_vel if you want even more, e.g. 1.5
-    base_env = StretchRosEnv(writer=writer, max_lin_vel=1.0)
     env = wrap_env(base_env)
-
     device = env.device
 
-    # Models for PPO
-    policy_model = Policy(
-        env.observation_space, env.action_space, device=device
-    ).to(device)
-    value_model = Value(
-        env.observation_space, env.action_space, device=device
-    ).to(device)
-
+    print("Creating neural networks...")
+    policy_model = Policy(env.observation_space, env.action_space, device=device).to(device)
+    value_model = Value(env.observation_space, env.action_space, device=device).to(device)
     models = {"policy": policy_model, "value": value_model}
 
-    # Memory
-    memory = RandomMemory(
-        memory_size=2048, num_envs=env.num_envs, device=device
-    )
+    memory = RandomMemory(memory_size=2048, num_envs=env.num_envs, device=device)
 
-    # PPO config
     cfg_ppo = PPO_DEFAULT_CONFIG.copy()
     cfg_ppo["rollouts"] = 2048
     cfg_ppo["learning_epochs"] = 10
     cfg_ppo["mini_batches"] = 32
     cfg_ppo["discount_factor"] = 0.99
-    cfg_ppo["learning_rate"] = 3e-7
+    cfg_ppo["learning_rate"] = 3e-4
     cfg_ppo["grad_norm_clip"] = 0.5
     cfg_ppo["ratio_clip"] = 0.2
-    cfg_ppo["entropy_loss_scale"] = 0.0
+    cfg_ppo["entropy_loss_scale"] = 0.02
     cfg_ppo["value_loss_scale"] = 0.5
     cfg_ppo["state_preprocessor"] = None
     cfg_ppo["value_preprocessor"] = None
+    cfg_ppo["learning_rate_scheduler"] = None
+    cfg_ppo["learning_rate_scheduler_kwargs"] = {}
 
-    agent = PPO(
-        models=models,
-        memory=memory,
-        cfg=cfg_ppo,
-        observation_space=env.observation_space,
-        action_space=env.action_space,
-        device=device,
-    )
-
-    # Trainer config
-    cfg_trainer = {
-        "timesteps": 200_000,
-        "headless": True,
+    # FIXED: Same directory for all training runs
+    cfg_ppo["experiment"] = {
+        "directory": "runs",
+        "experiment_name": "stretch_continuous",  # Same name = continuous training
+        "write_interval": 0,  # Disable TensorBoard logging
+        "checkpoint_interval": 20_000,
+        "store_separately": False,
+        "wandb": False,
+        "wandb_kwargs": {},
     }
 
-    trainer = SequentialTrainer(
-        cfg=cfg_trainer, env=env, agents=agent
+    agent = PPO(
+        models=models, memory=memory, cfg=cfg_ppo,
+        observation_space=env.observation_space,
+        action_space=env.action_space, device=device,
     )
+
+    # Always use the same checkpoint directory
+    checkpoints_dir = os.path.join("runs", "stretch_continuous", "checkpoints")
+    best_ckpt = os.path.join(checkpoints_dir, "best_agent.pt")
+    
+    if os.path.exists(best_ckpt):
+        print(f"\n✓ Loading checkpoint: {best_ckpt}")
+        print("  Continuing previous training...")
+        agent.load(best_ckpt)
+    else:
+        print("\n✓ No checkpoint found")
+        print("  Starting fresh training...")
+
+    cfg_trainer = {"timesteps": 200_000, "headless": True}
+    trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
+
+    print("\n" + "="*70)
+    print("TRAINING STARTED")
+    print("Checkpoints save to: runs/stretch_continuous/checkpoints/")
+    print("="*70 + "\n")
 
     try:
         trainer.train()
     finally:
         env.close()
+        print("\n✓ Training complete! Progress saved to checkpoint.")
 
 
 if __name__ == "__main__":

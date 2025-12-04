@@ -1,4 +1,4 @@
-# RL.launch.py
+# launch.py
 #!/usr/bin/env python3
 import os
 from pathlib import Path
@@ -176,6 +176,7 @@ def generate_launch_description():
             executable="rviz2",
             name="rviz2",
             output="screen",
+            arguments=['-d', '/home/sean/.rviz2/stretch2.rviz'],
             remappings=[
                 ("/move_base_simple/goal", "/goal"),
                 ("/goal_pose", "/goal")
@@ -184,16 +185,7 @@ def generate_launch_description():
         )
     )
 
-    # --- Goal spawner via ExecuteProcess (no libexec / Node needed) ---
-    goal_proc = ExecuteProcess(
-        cmd=[
-            "python3",
-            "-m",
-            "senior_project.goal_spawner",
-        ],
-        output="screen",
-    )
-    ld.add_action(goal_proc)
+   
 
     # MuJoCo driver
     driver_params = [
@@ -273,7 +265,7 @@ def generate_launch_description():
 
     ld.add_action(
         LogInfo(
-            msg="[RL.launch] Sim + PPO learner + goal_spawner starting."
+            msg="[RL.launch] Sim + PPO learner"
         )
     )
     return ld
