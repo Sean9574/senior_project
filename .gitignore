@@ -1,2 +1,24 @@
-.vscode/browse.vc.db
-.vscode/browse.vc.db
+# Training data - don't commit large files
+training_data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+install/
+log/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db

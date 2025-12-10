@@ -1,4 +1,4 @@
-# launch.py
+# RL.launch.py
 #!/usr/bin/env python3
 import os
 from pathlib import Path
@@ -41,6 +41,44 @@ def generate_launch_description():
             "use_cameras",
             default_value="true",
             choices=["true", "false"],
+        )
+    )
+
+    # ---- NEW: Hard Reset Arguments ----
+    ld.add_action(
+        DeclareLaunchArgument(
+            "episode_num",
+            default_value="1",
+            description="Current episode number (set by hard_reset.sh)"
+        )
+    )
+    ld.add_action(
+        DeclareLaunchArgument(
+            "models_dir",
+            default_value="./models",
+            description="Models checkpoint directory (set by hard_reset.sh)"
+        )
+    )
+    ld.add_action(
+        DeclareLaunchArgument(
+            "use_hard_reset",
+            default_value="false",
+            choices=["true", "false"],
+            description="Use hard reset (kill/restart) instead of normal training"
+        )
+    )
+    ld.add_action(
+        DeclareLaunchArgument(
+            "episode_length",
+            default_value="180",
+            description="Episode length in seconds (for hard reset mode)"
+        )
+    )
+    ld.add_action(
+        DeclareLaunchArgument(
+            "max_episodes",
+            default_value="30.0",
+            description="Maximum number of episodes (for hard reset mode)"
         )
     )
 
@@ -185,8 +223,6 @@ def generate_launch_description():
         )
     )
 
-   
-
     # MuJoCo driver
     driver_params = [
         {
@@ -255,6 +291,11 @@ def generate_launch_description():
             LaunchConfiguration("eval_every_steps"),
             "--eval_episodes",
             LaunchConfiguration("eval_episodes"),
+            # NEW: Pass hard reset arguments
+            "--episode_num",
+            LaunchConfiguration("episode_num"),
+            "--models_dir",
+            LaunchConfiguration("models_dir"),
         ],
         output="screen",
         condition=IfCondition(LaunchConfiguration("run_rl")),
@@ -262,6 +303,28 @@ def generate_launch_description():
 
     # Delay slightly so sim is alive first
     ld.add_action(TimerAction(period=2.0, actions=[learner_proc]))
+
+    # ---- NEW: HARD RESET MODE ----
+    # Find the bash script (assuming it's in SENIOR_PROJECT/scripts/)
+    # Get the path relative to this launch file
+    launch_file_dir = os.path.dirname(os.path.abspath(__file__))
+    package_dir = os.path.dirname(launch_file_dir)  # Go up from launch/ to package root
+    bash_script_path = os.path.join(package_dir, 'scripts', 'hard_reset.sh')
+    
+    # Execute hard reset bash script instead of normal launch
+    hard_reset_proc = ExecuteProcess(
+        cmd=[
+            'bash',
+            bash_script_path,
+            LaunchConfiguration("episode_length"),
+            LaunchConfiguration("max_episodes")
+        ],
+        output='screen',
+        shell=False,
+        condition=IfCondition(LaunchConfiguration("use_hard_reset")),
+    )
+    
+    ld.add_action(hard_reset_proc)
 
     ld.add_action(
         LogInfo(
