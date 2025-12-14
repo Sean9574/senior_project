@@ -1,4 +1,3 @@
-# RL.launch.py
 #!/usr/bin/env python3
 import os
 from pathlib import Path
@@ -41,6 +40,16 @@ def generate_launch_description():
             "use_cameras",
             default_value="true",
             choices=["true", "false"],
+        )
+    )
+    
+    # ---- NEW: Reward Monitor Argument ----
+    ld.add_action(
+        DeclareLaunchArgument(
+            "use_reward_monitor",
+            default_value="true",
+            choices=["true", "false"],
+            description="Launch real-time reward monitoring web interface"
         )
     )
 
@@ -226,7 +235,7 @@ def generate_launch_description():
     # MuJoCo driver
     driver_params = [
         {
-            "rate": 30.0,
+            "rate": 300.0,  # 10x faster simulation
             "timeout": 0.5,
             "broadcast_odom_tf": LaunchConfiguration("broadcast_odom_tf"),
             "fail_out_of_range_goal": LaunchConfiguration(
@@ -267,34 +276,34 @@ def generate_launch_description():
             "senior_project.learner_node",
             "--ns",
             LaunchConfiguration("ns"),
-            "--total_steps",
+            "--total-steps",
             LaunchConfiguration("total_steps"),
-            "--rollout_steps",
+            "--rollout-steps",
             LaunchConfiguration("rollout_steps"),
-            "--ckpt_dir",
+            "--ckpt-dir",
             LaunchConfiguration("ckpt_dir"),
-            "--load_ckpt",
+            "--load-ckpt",
             LaunchConfiguration("load_ckpt"),
-            "--odom_topic",
+            "--odom-topic",
             LaunchConfiguration("odom_topic"),
-            "--cmd_topic",
+            "--cmd-topic",
             LaunchConfiguration("cmd_topic"),
-            "--lidar_topic",
+            "--lidar-topic",
             LaunchConfiguration("lidar_topic"),
-            "--imu_topic",
+            "--imu-topic",
             LaunchConfiguration("imu_topic"),
-            "--use_obstacle",
+            "--use-obstacle",
             LaunchConfiguration("use_obstacle"),
-            "--goal_topic",
+            "--goal-topic",
             LaunchConfiguration("goal_topic"),
-            "--eval_every_steps",
+            "--eval-every-steps",
             LaunchConfiguration("eval_every_steps"),
-            "--eval_episodes",
+            "--eval-episodes",
             LaunchConfiguration("eval_episodes"),
             # NEW: Pass hard reset arguments
-            "--episode_num",
+            "--episode-num",
             LaunchConfiguration("episode_num"),
-            "--models_dir",
+            "--models-dir",
             LaunchConfiguration("models_dir"),
         ],
         output="screen",
@@ -303,12 +312,23 @@ def generate_launch_description():
 
     # Delay slightly so sim is alive first
     ld.add_action(TimerAction(period=2.0, actions=[learner_proc]))
+    
+    # --- START REWARD MONITOR ---
+    launch_file_dir = os.path.dirname(os.path.abspath(__file__))
+    package_dir = os.path.dirname(launch_file_dir)
+    reward_monitor_path = os.path.join(package_dir, 'scripts', 'reward_monitor.py')
+    
+    reward_monitor_proc = ExecuteProcess(
+        cmd=['python3', reward_monitor_path],
+        output='screen',
+        condition=IfCondition(LaunchConfiguration("use_reward_monitor")),
+    )
+    
+    # Start reward monitor after learner starts
+    ld.add_action(TimerAction(period=5.0, actions=[reward_monitor_proc]))
 
     # ---- NEW: HARD RESET MODE ----
     # Find the bash script (assuming it's in SENIOR_PROJECT/scripts/)
-    # Get the path relative to this launch file
-    launch_file_dir = os.path.dirname(os.path.abspath(__file__))
-    package_dir = os.path.dirname(launch_file_dir)  # Go up from launch/ to package root
     bash_script_path = os.path.join(package_dir, 'scripts', 'hard_reset.sh')
     
     # Execute hard reset bash script instead of normal launch
@@ -328,7 +348,7 @@ def generate_launch_description():
 
     ld.add_action(
         LogInfo(
-            msg="[RL.launch] Sim + PPO learner"
+            msg="[RL.launch] Sim + PPO learner + Reward Monitor"
         )
     )
     return ld
