@@ -4,6 +4,10 @@ Stretch Robot RL Environment + Learner (NO SKRL, TD3 PURE PYTORCH, LAUNCH COMPAT
 
 Adds requested behavior:
 - When goal reached: log SUCCESS, command STOP, hold stop briefly, terminate episode (no spinning).
+
+UPDATED (Obstacle-aware avoidance):
+- Uses LiDAR direction (front/left/right + repulsive vector) to steer around obstacles toward goal.
+- Blends/overrides policy action with avoidance when obstacles are inside SAFE distance.
 """
 
 import argparse
@@ -45,8 +49,8 @@ AUTO_LOAD_CHECKPOINT_FOR_INFERENCE = True
 CHECKPOINT_FILENAME = "td3_agent.pt"
 
 GOAL_MODE = "fixed"  # "fixed" or "curriculum"
-FIXED_GOAL_X = -5.0
-FIXED_GOAL_Y = 4.0
+FIXED_GOAL_X = 3.0
+FIXED_GOAL_Y = -4.0
 EPISODE_SECONDS = 45.0
 
 CURR_START_RADIUS = 1.5
@@ -60,8 +64,13 @@ CURR_STEP_DOWN = 0.5
 DEFAULT_START_STEPS = 8000
 DEFAULT_EXPL_NOISE = 0.35
 
-DEFAULT_COLLISION_DIST = 0.12
-DEFAULT_SAFE_DIST = 0.18
+# --------------------------
+# IMPORTANT: make avoidance kick in EARLY enough to "care"
+# --------------------------
+# Hard collision stop (meters)
+DEFAULT_COLLISION_DIST = 0.20
+# Start avoiding earlier (meters)
+DEFAULT_SAFE_DIST = 0.60
 
 R_GOAL = 2500.0
 R_COLLISION = -2000.0
@@ -70,7 +79,7 @@ R_TIMEOUT_NORMAL = -500.0
 
 GOAL_RADIUS = 0.45
 
-# Success stop behavior (NEW)
+# Success stop behavior
 STOP_ON_SUCCESS = True
 SUCCESS_BRAKE_HOLD_SECONDS = 1.0   # hold cmd_vel = 0 for this long on success
 
@@ -93,6 +102,48 @@ FINISH_FORWARD_GATING_DEG = 35.0
 TURN_TO_GOAL_BONUS = 0.25
 
 OBSTACLE_W = 6.0
+
+# =============================================================================
+# LIDAR-AWARE AVOIDANCE LAYER (directional)
+# =============================================================================
+
+AVOID_ENABLE = True
+
+# How to apply avoidance:
+# - "blend": blend policy (TD3) action with avoidance when obstacles are within SAFE distance
+# - "override": fully override policy when obstacles are within SAFE distance
+AVOID_MODE = "override"  # "blend" or "override"
+
+# Start avoiding at SAFE; hard stop at COLLISION
+AVOID_SAFE_DIST = DEFAULT_SAFE_DIST
+AVOID_COLLISION_DIST = DEFAULT_COLLISION_DIST
+
+# Sector widths (radians). Front centered at "forward"
+FRONT_HALF_ANGLE_RAD = math.radians(25.0)
+SIDE_HALF_ANGLE_RAD  = math.radians(35.0)
+LEFT_CENTER_RAD      = math.radians(-90.0)
+RIGHT_CENTER_RAD     = math.radians(90.0)
+
+# If your scan "front" is actually the robot rear, set this to math.pi
+LIDAR_FORWARD_OFFSET_RAD = math.pi
+
+# Repulsion settings
+REPULSE_GAIN = 1.35
+REPULSE_DECAY = 0.35
+
+# Desired clearance target for speed scaling
+AVOID_CLEARANCE_TARGET = 0.55
+
+# Turn limit scaling
+AVOID_W_MAX_FRACTION = 1.0  # fraction of env.w_max
+
+# Allow small reverse when front is blocked
+AVOID_ALLOW_REVERSE = True
+AVOID_REVERSE_V = -0.04  # m/s when front is very close
+
+# Debug (prints min_front/left/right/all + commands)
+AVOID_DEBUG = True
+AVOID_DEBUG_EVERY_N_STEPS = 10
 
 
 # =============================================================================
@@ -296,7 +347,6 @@ class StretchRosEnv(gym.Env):
         self._cached_bins = None
         self._cached_state = None
 
-        # NEW: success latch to prevent any further motion after success in the same episode
         self._success_latched = False
 
         self.action_space = spaces.Box(
@@ -320,13 +370,17 @@ class StretchRosEnv(gym.Env):
             self.ros.get_logger().info(f"[ENV] Fixed goal: ({self.fixed_goal_x:.2f}, {self.fixed_goal_y:.2f})")
         self.ros.get_logger().info(f"[ENV] goal_radius={self.goal_radius:.2f} max_steps={self.max_steps}")
         self.ros.get_logger().info(f"[ENV] BOOTSTRAP_MODE={BOOTSTRAP_MODE} timeout_penalty={self.r_timeout_terminal}")
+        self.ros.get_logger().info(
+            f"[AVOID] ENABLE={AVOID_ENABLE} MODE={AVOID_MODE} SAFE={AVOID_SAFE_DIST:.2f} COLL={AVOID_COLLISION_DIST:.2f} "
+            f"(reward safe_dist={self.safe_dist:.2f} collision_dist={self.collision_dist:.2f})"
+        )
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
         self.step_count = 0
         self.episode_return = 0.0
         self.prev_action[:] = 0.0
-        self._success_latched = False  # NEW
+        self._success_latched = False
 
         self._set_new_goal(first_time=False)
         self.prev_goal_dist = self._goal_distance()
@@ -335,11 +389,135 @@ class StretchRosEnv(gym.Env):
         info = {"goal_distance": float(self.prev_goal_dist), "curr_radius": float(self.curr_radius)}
         return obs, info
 
+    # ---------------------------
+    # Directional LiDAR helpers
+    # ---------------------------
+
+    def _sanitize_ranges(self, scan: LaserScan) -> np.ndarray:
+        r = np.array(scan.ranges, dtype=np.float32)
+        max_r = float(scan.range_max if scan.range_max > 0 else self.lidar_max_range)
+        min_r = float(scan.range_min if scan.range_min > 0 else 0.01)
+        if r.size == 0:
+            return np.full((1,), max_r, dtype=np.float32)
+        bad = np.isnan(r) | np.isinf(r) | (r < min_r) | (r > max_r)
+        r[bad] = max_r
+        return r
+
+    def _lidar_sectors(self) -> Tuple[float, float, float, float]:
+        """
+        Returns (min_front, min_left, min_right, min_all) using actual scan angles.
+        Assumes scan angle 0 is forward; adjust with LIDAR_FORWARD_OFFSET_RAD if needed.
+        """
+        scan = self.ros.last_scan
+        if scan is None:
+            return self.lidar_max_range, self.lidar_max_range, self.lidar_max_range, self.lidar_max_range
+
+        ranges = self._sanitize_ranges(scan)
+        n = ranges.size
+        a0 = float(scan.angle_min)
+        da = float(scan.angle_increment if scan.angle_increment != 0 else (scan.angle_max - scan.angle_min) / max(1, n - 1))
+
+        angles = a0 + da * np.arange(n, dtype=np.float32)
+        angles = angles + float(LIDAR_FORWARD_OFFSET_RAD)
+        angles = np.arctan2(np.sin(angles), np.cos(angles))
+
+        def sector_min(center: float, half: float) -> float:
+            d = np.abs(np.arctan2(np.sin(angles - center), np.cos(angles - center)))
+            m = d <= half
+            if not np.any(m):
+                return float(np.min(ranges))
+            return float(np.min(ranges[m]))
+
+        min_front = sector_min(0.0, float(FRONT_HALF_ANGLE_RAD))
+        min_left  = sector_min(float(LEFT_CENTER_RAD), float(SIDE_HALF_ANGLE_RAD))
+        min_right = sector_min(float(RIGHT_CENTER_RAD), float(SIDE_HALF_ANGLE_RAD))
+        min_all   = float(max(0.01, np.min(ranges)))
+        return min_front, min_left, min_right, min_all
+
+    def _repulsive_vector(self) -> Tuple[float, float, float]:
+        """
+        Compute a simple 2D repulsion vector in the robot frame from the scan:
+        - Each ray pushes opposite its direction, weighted by distance (closer -> stronger).
+        Returns (rx, ry, min_all).
+        """
+        scan = self.ros.last_scan
+        if scan is None:
+            return 0.0, 0.0, self.lidar_max_range
+
+        ranges = self._sanitize_ranges(scan)
+        n = ranges.size
+        a0 = float(scan.angle_min)
+        da = float(scan.angle_increment if scan.angle_increment != 0 else (scan.angle_max - scan.angle_min) / max(1, n - 1))
+        angles = a0 + da * np.arange(n, dtype=np.float32)
+        angles = angles + float(LIDAR_FORWARD_OFFSET_RAD)
+        angles = np.arctan2(np.sin(angles), np.cos(angles))
+
+        min_all = float(max(0.01, np.min(ranges)))
+
+        influence = np.clip((AVOID_CLEARANCE_TARGET - ranges) / max(1e-3, AVOID_CLEARANCE_TARGET), 0.0, 1.0)
+        w = (influence ** 2) * float(REPULSE_GAIN)
+
+        rx = float(np.sum(-np.cos(angles) * w))
+        ry = float(np.sum(-np.sin(angles) * w))
+
+        norm = math.hypot(rx, ry)
+        if norm > 1e-6:
+            rx *= float(REPULSE_DECAY)
+            ry *= float(REPULSE_DECAY)
+
+        return rx, ry, min_all
+
+    def _avoidance_action(self, policy_v: float, policy_w: float) -> Tuple[float, float, float]:
+        """
+        Compute an avoidance (v_cmd, w_cmd) and a blend factor alpha in [0,1]
+        where alpha=0 means no avoidance, alpha=1 means full avoidance.
+        """
+        min_front, min_left, min_right, min_all = self._lidar_sectors()
+
+        if min_all >= AVOID_SAFE_DIST:
+            return policy_v, policy_w, 0.0
+
+        alpha = float(np.clip((AVOID_SAFE_DIST - min_all) / max(1e-3, (AVOID_SAFE_DIST - AVOID_COLLISION_DIST)), 0.0, 1.0))
+
+        if min_all <= AVOID_COLLISION_DIST:
+            return 0.0, 0.0, 1.0
+
+        goal_ang = float(self._goal_angle_relative())
+
+        rx, ry, _ = self._repulsive_vector()
+
+        gx = float(math.cos(goal_ang))
+        gy = float(math.sin(goal_ang))
+
+        vx = gx + rx
+        vy = gy + ry
+
+        if math.hypot(vx, vy) < 1e-4:
+            if min_left < min_right:
+                desired_ang = -math.radians(75.0)
+            else:
+                desired_ang = math.radians(75.0)
+        else:
+            desired_ang = math.atan2(vy, vx)
+
+        k_w = 2.2
+        w_cmd = float(np.clip(k_w * wrap_to_pi(desired_ang), -self.w_max * AVOID_W_MAX_FRACTION, self.w_max * AVOID_W_MAX_FRACTION))
+
+        v_base = float(np.clip(policy_v, 0.0, self.v_max))
+        slow = float(np.clip(min_all / max(1e-3, AVOID_CLEARANCE_TARGET), 0.0, 1.0))
+        v_cmd = v_base * slow
+
+        if min_front < (AVOID_SAFE_DIST * 0.95):
+            v_cmd = min(v_cmd, 0.06 * slow)
+            if AVOID_ALLOW_REVERSE and min_front < (AVOID_COLLISION_DIST + 0.10):
+                v_cmd = float(AVOID_REVERSE_V)
+
+        return v_cmd, w_cmd, alpha
+
     def step(self, action: np.ndarray):
         self._cached_bins = None
         self._cached_state = None
 
-        # If we've already succeeded this episode, hard-stop and finish immediately
         if self._success_latched and STOP_ON_SUCCESS:
             self.ros.send_cmd(0.0, 0.0)
             obs = self._build_observation()
@@ -356,8 +534,29 @@ class StretchRosEnv(gym.Env):
         if v_cmd < self.v_min_reverse:
             v_cmd = self.v_min_reverse
 
-        min_all = self._min_all_lidar()
-        if min_all < self.collision_dist:
+        # Lidar-aware avoidance (directional)
+        alpha = 0.0
+        min_front = min_left = min_right = min_all_dir = None
+
+        if AVOID_ENABLE:
+            v_avoid, w_avoid, alpha = self._avoidance_action(v_cmd, w_cmd)
+
+            if AVOID_MODE == "override" and alpha > 0.0:
+                v_cmd, w_cmd = v_avoid, w_avoid
+            elif AVOID_MODE == "blend" and alpha > 0.0:
+                v_cmd = (1.0 - alpha) * v_cmd + alpha * v_avoid
+                w_cmd = (1.0 - alpha) * w_cmd + alpha * w_avoid
+
+            if AVOID_DEBUG and (self.step_count % max(1, int(AVOID_DEBUG_EVERY_N_STEPS)) == 0):
+                min_front, min_left, min_right, min_all_dir = self._lidar_sectors()
+                self.ros.get_logger().info(
+                    f"[AVOIDDBG] a={alpha:.2f} front={min_front:.2f} left={min_left:.2f} right={min_right:.2f} "
+                    f"all={min_all_dir:.2f} cmd(v={v_cmd:.2f}, w={w_cmd:.2f}) goal_ang={self._goal_angle_relative():+.2f}"
+                )
+
+        # Extra hard safety: if we're inside collision_dist, stop now
+        min_all_bins = self._min_all_lidar()
+        if min_all_bins < self.collision_dist:
             v_cmd = 0.0
             w_cmd = 0.0
 
@@ -370,7 +569,6 @@ class StretchRosEnv(gym.Env):
         obs = self._build_observation()
         reward, terminated, collided, terms = self._compute_reward_and_done(v_cmd, w_cmd)
 
-        # NEW: On success, immediately brake/hold so it doesn't spin at goal
         if STOP_ON_SUCCESS and terms.get("goal", 0.0) > 0.0:
             self._success_latched = True
             self.ros.send_cmd(0.0, 0.0)
