@@ -118,6 +118,11 @@ AVOID_MODE = "override"  # "blend" or "override"
 AVOID_SAFE_DIST = DEFAULT_SAFE_DIST
 AVOID_COLLISION_DIST = DEFAULT_COLLISION_DIST
 
+# --- Linear speed policy ---
+AVOID_MIN_FWD_V = 0.40        # HARD minimum to overcome friction (while avoiding)
+CLEAR_SPEED_BOOST = 1.00      # keep 1.0 to respect v_max; raise to >1.0 only if you also raise v_max
+CLEAR_MARGIN = 0.25           # meters beyond SAFE where we allow full speed
+
 # Sector widths (radians). Front centered at "forward"
 FRONT_HALF_ANGLE_RAD = math.radians(25.0)
 SIDE_HALF_ANGLE_RAD  = math.radians(35.0)
@@ -293,7 +298,7 @@ class StretchRosEnv(gym.Env):
         control_dt: float = 0.1,
         num_lidar_bins: int = 60,
         lidar_max_range: float = 20.0,
-        v_max: float = 0.22,
+        v_max: float = 3.50,
         w_max: float = 2.84,
         v_min_reverse: float = -0.05,
         episode_time_seconds: float = EPISODE_SECONDS,
@@ -1081,8 +1086,8 @@ def main():
         episode_time_seconds=EPISODE_SECONDS,
         num_lidar_bins=60,
         lidar_max_range=20.0,
-        v_max=0.22,
-        w_max=2.84,
+        v_max=0.7,
+        w_max=3.5,
         use_curriculum=use_curriculum,
         fixed_goal_x=FIXED_GOAL_X,
         fixed_goal_y=FIXED_GOAL_Y,
