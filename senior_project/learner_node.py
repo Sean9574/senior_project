@@ -48,7 +48,7 @@ AUTO_LOAD_CHECKPOINT_FOR_TRAINING = True
 AUTO_LOAD_CHECKPOINT_FOR_INFERENCE = True
 CHECKPOINT_FILENAME = "td3_agent.pt"
 
-GOAL_MODE = "fixed"  # "fixed" or "curriculum"
+GOAL_MODE = "curriculum"  # "fixed" or "curriculum"
 FIXED_GOAL_X = 3.0
 FIXED_GOAL_Y = -4.0
 EPISODE_SECONDS = 45.0
@@ -68,9 +68,9 @@ DEFAULT_EXPL_NOISE = 0.35
 # IMPORTANT: make avoidance kick in EARLY enough to "care"
 # --------------------------
 # Hard collision stop (meters)
-DEFAULT_COLLISION_DIST = 0.20
+DEFAULT_COLLISION_DIST = 0.40
 # Start avoiding earlier (meters)
-DEFAULT_SAFE_DIST = 0.60
+DEFAULT_SAFE_DIST = 0.8
 
 R_GOAL = 2500.0
 R_COLLISION = -2000.0
@@ -88,18 +88,18 @@ SUCCESS_BRAKE_HOLD_SECONDS = 1.0   # hold cmd_vel = 0 for this long on success
 # --------------------------
 PROGRESS_SCALE = 650.0
 FORWARD_HEADING_GATE_DEG = 70.0
-FORWARD_WHEN_ALIGNED_BONUS = 1.20
-FORWARD_WHEN_MISALIGNED_PENALTY = 1.20
-ALIGN_W = 2.00
+FORWARD_WHEN_ALIGNED_BONUS = 5.0
+FORWARD_WHEN_MISALIGNED_PENALTY = 2.5
+ALIGN_W = 4.00
 DIST_SHAPING_K = 0.20
 STEP_COST = -0.03
 
-FINISH_DIST = 2.0
-FINISH_ALIGN_W = 3.0
-FINISH_FWD_W = 3.0
+FINISH_DIST = 2.75
+FINISH_ALIGN_W = 5.0
+FINISH_FWD_W = 1.5
 FINISH_TURN_PENALTY_W = 0.45
 FINISH_FORWARD_GATING_DEG = 35.0
-TURN_TO_GOAL_BONUS = 0.25
+TURN_TO_GOAL_BONUS = 1.50
 
 OBSTACLE_W = 6.0
 
@@ -133,8 +133,8 @@ RIGHT_CENTER_RAD     = math.radians(90.0)
 LIDAR_FORWARD_OFFSET_RAD = math.pi
 
 # Repulsion settings
-REPULSE_GAIN = 1.35
-REPULSE_DECAY = 0.35
+REPULSE_GAIN = 1.65
+REPULSE_DECAY = 0.55
 
 # Desired clearance target for speed scaling
 AVOID_CLEARANCE_TARGET = 0.55
@@ -1086,8 +1086,8 @@ def main():
         episode_time_seconds=EPISODE_SECONDS,
         num_lidar_bins=60,
         lidar_max_range=20.0,
-        v_max=0.7,
-        w_max=3.5,
+        v_max=1.25,
+        w_max=7.0,
         use_curriculum=use_curriculum,
         fixed_goal_x=FIXED_GOAL_X,
         fixed_goal_y=FIXED_GOAL_Y,

@@ -8,8 +8,8 @@ source ~/ament_ws/install/setup.bash
 PACKAGE_NAME="senior_project"
 LAUNCH_FILE="RL.launch.py"
 MODELS_DIR="./models"
-MAX_EPISODES=500
-EPISODE_TIME=62
+MAX_EPISODES=200
+EPISODE_TIME=180
 
 # Create models directory
 mkdir -p "${MODELS_DIR}/current"
