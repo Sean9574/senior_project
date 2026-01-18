@@ -48,8 +48,8 @@ AUTO_LOAD_CHECKPOINT_FOR_TRAINING = True
 AUTO_LOAD_CHECKPOINT_FOR_INFERENCE = True
 CHECKPOINT_FILENAME = "td3_agent.pt"
 
-GOAL_MODE = "curriculum"  # "fixed" or "curriculum"
-FIXED_GOAL_X = 3.0
+GOAL_MODE = "fixed"  # "fixed" or "curriculum"
+FIXED_GOAL_X = -3.0
 FIXED_GOAL_Y = -4.0
 EPISODE_SECONDS = 45.0
 

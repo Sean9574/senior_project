@@ -5,8 +5,17 @@
   <description>Stretch 2 RL integration with MuJoCo simulation.</description>
 
   <maintainer email="sbrainard@ltu.edu">sean</maintainer>
-  <license>Apache 2.0</license>
-  
+  <license>Apache-2.0</license>
+
+  <!-- Required for Python packages -->
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- Typical runtime deps (add others you use) -->
+  <exec_depend>rclpy</exec_depend>
+
+  <!-- If you have launch files (you do), this is commonly needed -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>

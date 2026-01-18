@@ -25,6 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'learner_node = senior_project.learner_node:main',
+            'sam3_ros_node = senior_project.sam3_ros_node:main',
+            'sam3_room_scanner = senior_project.sam3_room_scanner:main',
             
         ],
     },
