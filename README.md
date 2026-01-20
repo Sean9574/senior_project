@@ -23,7 +23,7 @@ The system enables the robot to learn manipulation and navigation tasks while dy
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬──────┘ │
 └─────────┼──────────────────┼──────────────────┼──────────────────┼──────┘
           │                  │                  │                  │
-          │ /camera/color/   │ /scan            │ /joint_states    │ /cmd_vel
+          │ /camera/color/   │ /stretch/scan            │ /joint_states    │ /stretch/cmd_vel
           │ image_raw        │                  │                  │
           ▼                  ▼                  ▼                  ▲
 ┌─────────────────────────────────────────────────────────────────┴──────┐
