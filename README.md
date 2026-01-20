@@ -74,7 +74,7 @@ The system enables the robot to learn manipulation and navigation tasks while dy
 |-------|------|-------------|
 | `/camera/color/image_raw` | sensor_msgs/Image | RGB camera feed |
 | `/camera/depth/image_rect_raw` | sensor_msgs/Image | Depth image |
-| `/scan` | sensor_msgs/LaserScan | LiDAR scans |
+| `/stretch/scan` | sensor_msgs/LaserScan | LiDAR scans |
 | `/joint_states` | sensor_msgs/JointState | Robot joint positions |
 | `/perception/objects` | vision_msgs/Detection2DArray | Detected objects |
 | `/change_detection/changes` | sensor_msgs/Image | Change visualization |
@@ -82,7 +82,7 @@ The system enables the robot to learn manipulation and navigation tasks while dy
 | `/rl/state` | std_msgs/Float32MultiArray | Current state vector |
 | `/rl/action` | std_msgs/Float32MultiArray | Selected action |
 | `/rl/reward` | std_msgs/Float32 | Current reward |
-| `/cmd_vel` | geometry_msgs/Twist | Velocity commands |
+| `/stretch/cmd_vel` | geometry_msgs/Twist | Velocity commands |
 | `/stretch/joint_trajectory` | trajectory_msgs/JointTrajectory | Arm commands |
 
 ## Installation
