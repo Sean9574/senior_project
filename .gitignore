@@ -12,7 +12,7 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
-
+miniconda3/
 # Build artifacts
 build/
 install/

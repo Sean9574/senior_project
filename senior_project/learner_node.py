@@ -2,12 +2,11 @@
 """
 Stretch Robot RL Environment + Learner (NO SKRL, TD3 PURE PYTORCH, LAUNCH COMPAT)
 
-Adds requested behavior:
-- When goal reached: log SUCCESS, command STOP, hold stop briefly, terminate episode (no spinning).
-
-UPDATED (Obstacle-aware avoidance):
-- Uses LiDAR direction (front/left/right + repulsive vector) to steer around obstacles toward goal.
-- Blends/overrides policy action with avoidance when obstacles are inside SAFE distance.
+UPDATED:
+- Removed ALL internal goal spawning.
+- The environment now expects goals to be published externally to /<ns>/<goal_topic>
+  as geometry_msgs/PointStamped (e.g., /stretch/goal).
+- On startup and on reset, it waits for a goal message (with a timeout).
 """
 
 import argparse
@@ -36,7 +35,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Float32
 from std_msgs.msg import String as StringMsg
-from visualization_msgs.msg import Marker
 
 # =============================================================================
 # CONFIG (EDIT THESE — NO CLI REQUIRED)
@@ -48,18 +46,7 @@ AUTO_LOAD_CHECKPOINT_FOR_TRAINING = True
 AUTO_LOAD_CHECKPOINT_FOR_INFERENCE = True
 CHECKPOINT_FILENAME = "td3_agent.pt"
 
-GOAL_MODE = "fixed"  # "fixed" or "curriculum"
-FIXED_GOAL_X = -3.0
-FIXED_GOAL_Y = -4.0
 EPISODE_SECONDS = 45.0
-
-CURR_START_RADIUS = 1.5
-CURR_MAX_RADIUS = 6.0
-CURR_PROMOTE_THRESHOLD = 0.70
-CURR_DEMOTE_THRESHOLD = 0.20
-CURR_WINDOW = 50
-CURR_STEP_UP = 0.5
-CURR_STEP_DOWN = 0.5
 
 DEFAULT_START_STEPS = 8000
 DEFAULT_EXPL_NOISE = 0.35
@@ -82,6 +69,13 @@ GOAL_RADIUS = 0.45
 # Success stop behavior
 STOP_ON_SUCCESS = True
 SUCCESS_BRAKE_HOLD_SECONDS = 1.0   # hold cmd_vel = 0 for this long on success
+
+# --------------------------
+# Goal handling (external publisher)
+# --------------------------
+WAIT_FOR_GOAL_ON_START = True
+WAIT_FOR_GOAL_ON_RESET = True
+GOAL_WAIT_TIMEOUT_SEC = 10.0  # how long to wait for a goal message before continuing
 
 # --------------------------
 # Reward shaping (core)
@@ -171,17 +165,6 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-@dataclass
-class CurriculumConfig:
-    start_radius: float = CURR_START_RADIUS
-    max_radius: float = CURR_MAX_RADIUS
-    promote_threshold: float = CURR_PROMOTE_THRESHOLD
-    demote_threshold: float = CURR_DEMOTE_THRESHOLD
-    window: int = CURR_WINDOW
-    step_up: float = CURR_STEP_UP
-    step_down: float = CURR_STEP_DOWN
-
-
 # =============================================================================
 # ROS Interface
 # =============================================================================
@@ -209,8 +192,6 @@ class StretchRosInterfaceNode(Node):
         self.create_subscription(PointStamped, goal_name, self.goal_cb, 10)
 
         self.cmd_pub = self.create_publisher(Twist, cmd_name, 10)
-        self.goal_pub = self.create_publisher(PointStamped, goal_name, 10)
-        self.goal_marker_pub = self.create_publisher(Marker, f"/{ns}/goal_marker", 10)
 
         self.reward_pub = self.create_publisher(Float32, f"/{ns}/reward", 10)
         self.reward_breakdown_pub = self.create_publisher(StringMsg, "/reward_breakdown", 10)
@@ -236,6 +217,15 @@ class StretchRosInterfaceNode(Node):
         self.get_logger().warn("[ENV] Timeout waiting for initial sensors")
         return False
 
+    def wait_for_goal(self, timeout_sec: float = 10.0) -> bool:
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            if self.last_goal is not None:
+                return True
+            rclpy.spin_once(self, timeout_sec=0.1)
+        self.get_logger().warn("[ENV] Timeout waiting for goal message (external goal publisher?)")
+        return False
+
     def send_cmd(self, v: float, w: float):
         msg = Twist()
         msg.linear.x = float(v)
@@ -249,40 +239,6 @@ class StretchRosInterfaceNode(Node):
             self.send_cmd(0.0, 0.0)
             rclpy.spin_once(self, timeout_sec=0.01)
             time.sleep(0.02)
-
-    def publish_goal(self, goal_x: float, goal_y: float, frame_id: str = "odom"):
-        goal_msg = PointStamped()
-        goal_msg.header.stamp = self.get_clock().now().to_msg()
-        goal_msg.header.frame_id = frame_id
-        goal_msg.point.x = float(goal_x)
-        goal_msg.point.y = float(goal_y)
-        goal_msg.point.z = 0.0
-        self.goal_pub.publish(goal_msg)
-        self.last_goal = goal_msg
-        self.publish_goal_marker(goal_x, goal_y, frame_id=frame_id)
-
-    def publish_goal_marker(self, goal_x: float, goal_y: float, frame_id: str = "odom"):
-        marker = Marker()
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.header.frame_id = frame_id
-        marker.ns = "goal"
-        marker.id = 0
-        marker.type = Marker.SPHERE
-        marker.action = Marker.ADD
-        marker.pose.position.x = float(goal_x)
-        marker.pose.position.y = float(goal_y)
-        marker.pose.position.z = 0.3
-        marker.pose.orientation.w = 1.0
-        marker.scale.x = 0.6
-        marker.scale.y = 0.6
-        marker.scale.z = 0.6
-        marker.color.r = 0.0
-        marker.color.g = 1.0
-        marker.color.b = 0.0
-        marker.color.a = 0.8
-        marker.lifetime.sec = 0
-        marker.lifetime.nanosec = 0
-        self.goal_marker_pub.publish(marker)
 
 
 # =============================================================================
@@ -305,10 +261,6 @@ class StretchRosEnv(gym.Env):
         goal_radius: float = GOAL_RADIUS,
         collision_dist: float = DEFAULT_COLLISION_DIST,
         safe_dist: float = DEFAULT_SAFE_DIST,
-        use_curriculum: bool = True,
-        curriculum: CurriculumConfig = CurriculumConfig(),
-        fixed_goal_x: float = 2.0,
-        fixed_goal_y: float = 0.0,
         max_goal_radius_for_norm: float = 6.0,
         r_goal: float = R_GOAL,
         r_collision: float = R_COLLISION,
@@ -330,18 +282,11 @@ class StretchRosEnv(gym.Env):
         self.collision_dist = float(collision_dist)
         self.safe_dist = float(safe_dist)
 
-        self.use_curriculum = bool(use_curriculum)
-        self.curriculum = curriculum
-        self.fixed_goal_x = float(fixed_goal_x)
-        self.fixed_goal_y = float(fixed_goal_y)
         self.max_goal_radius_for_norm = float(max_goal_radius_for_norm)
 
         self.r_goal_terminal = float(r_goal)
         self.r_collision_terminal = float(r_collision)
         self.r_timeout_terminal = float(r_timeout)
-
-        self.recent_success = deque(maxlen=self.curriculum.window)
-        self.curr_radius = self.curriculum.start_radius
 
         self.step_count = 0
         self.episode_index = int(os.environ.get("RL_EPISODE_NUM", 1))
@@ -366,13 +311,12 @@ class StretchRosEnv(gym.Env):
         self.ros.get_logger().info("[ENV] Waiting for sensors...")
         self.ros.wait_for_sensors(timeout_sec=10.0)
 
-        self._set_new_goal(first_time=True)
+        if WAIT_FOR_GOAL_ON_START:
+            self.ros.get_logger().info("[ENV] Waiting for external goal message...")
+            self.ros.wait_for_goal(timeout_sec=GOAL_WAIT_TIMEOUT_SEC)
+
         self.prev_goal_dist = self._goal_distance()
 
-        mode = "CURRICULUM" if self.use_curriculum else "FIXED"
-        self.ros.get_logger().info(f"[ENV] Goal mode: {mode}")
-        if not self.use_curriculum:
-            self.ros.get_logger().info(f"[ENV] Fixed goal: ({self.fixed_goal_x:.2f}, {self.fixed_goal_y:.2f})")
         self.ros.get_logger().info(f"[ENV] goal_radius={self.goal_radius:.2f} max_steps={self.max_steps}")
         self.ros.get_logger().info(f"[ENV] BOOTSTRAP_MODE={BOOTSTRAP_MODE} timeout_penalty={self.r_timeout_terminal}")
         self.ros.get_logger().info(
@@ -387,11 +331,15 @@ class StretchRosEnv(gym.Env):
         self.prev_action[:] = 0.0
         self._success_latched = False
 
-        self._set_new_goal(first_time=False)
+        # No internal goal spawning: wait for external goal if requested
+        if WAIT_FOR_GOAL_ON_RESET and self.ros.last_goal is None:
+            self.ros.get_logger().info("[ENV] Reset: waiting for external goal message...")
+            self.ros.wait_for_goal(timeout_sec=GOAL_WAIT_TIMEOUT_SEC)
+
         self.prev_goal_dist = self._goal_distance()
 
         obs = self._build_observation()
-        info = {"goal_distance": float(self.prev_goal_dist), "curr_radius": float(self.curr_radius)}
+        info = {"goal_distance": float(self.prev_goal_dist)}
         return obs, info
 
     # ---------------------------
@@ -623,47 +571,16 @@ class StretchRosEnv(gym.Env):
 
         if terminated or truncated:
             success = bool(terms["goal"] > 0.0)
-            self.recent_success.append(1 if success else 0)
-            self._update_curriculum()
-
             status = "✓ SUCCESS" if success else ("✗ COLLISION" if collided else "⊗ TIMEOUT")
-            sr = float(np.mean(self.recent_success)) if len(self.recent_success) else 0.0
             self.ros.get_logger().info(
                 f"[EP {self.episode_index:04d}] {status} | "
                 f"Return {self.episode_return:+8.1f} | Steps {self.step_count:4d} | "
-                f"Dist {self._goal_distance():.2f}m | SR({len(self.recent_success)}): {sr:.0%} | "
-                f"CurrR {self.curr_radius:.1f}m"
+                f"Dist {self._goal_distance():.2f}m"
             )
             self.episode_index += 1
 
         info = {"collision": bool(collided), "goal_dist": float(self._goal_distance()), "reward_terms": terms}
         return obs, float(reward), bool(terminated), bool(truncated), info
-
-    def _update_curriculum(self):
-        if not self.use_curriculum:
-            return
-        if len(self.recent_success) < max(10, self.curriculum.window // 5):
-            return
-        sr = float(np.mean(self.recent_success))
-        if sr >= self.curriculum.promote_threshold and self.curr_radius < self.curriculum.max_radius:
-            self.curr_radius = min(self.curriculum.max_radius, self.curr_radius + self.curriculum.step_up)
-        elif sr <= self.curriculum.demote_threshold and self.curr_radius > self.curriculum.start_radius:
-            self.curr_radius = max(self.curriculum.start_radius, self.curr_radius - self.curriculum.step_down)
-
-    def _set_new_goal(self, first_time: bool):
-        if self.use_curriculum:
-            r_max = self.curr_radius
-            r_min = max(0.5, 0.7 * r_max)
-            ang = np.random.uniform(0.0, 2.0 * np.pi)
-            dist = np.random.uniform(r_min, r_max)
-            gx = dist * math.cos(ang)
-            gy = dist * math.sin(ang)
-        else:
-            gx, gy = self.fixed_goal_x, self.fixed_goal_y
-
-        self.ros.publish_goal(gx, gy, frame_id="odom")
-        rclpy.spin_once(self.ros, timeout_sec=0.05)
-        self.ros.get_logger().info(f"[GOAL] {'Init ' if first_time else ''}Goal ({gx:.2f}, {gy:.2f})")
 
     def _get_robot_state(self) -> Dict[str, float]:
         odom = self.ros.last_odom
@@ -727,21 +644,26 @@ class StretchRosEnv(gym.Env):
     def _build_observation(self) -> np.ndarray:
         goal = self.ros.last_goal
         odom = self.ros.last_odom
-        if goal is None or odom is None:
+        if odom is None:
             rclpy.spin_once(self.ros, timeout_sec=0.05)
-            goal = self.ros.last_goal
             odom = self.ros.last_odom
-        if goal is None or odom is None:
-            return np.zeros(self.observation_space.shape, dtype=np.float32)
 
+        # If goal not present yet, we still return a valid observation vector (goal terms become 0)
         bins = self._get_lidar_bins()
         lidar_norm = np.clip(bins / self.lidar_max_range, 0.0, 1.0)
 
         st = self._get_robot_state()
-        dx = float(goal.point.x) - st["x"]
-        dy = float(goal.point.y) - st["y"]
-        dist = math.hypot(dx, dy)
-        ang = self._goal_angle_relative()
+
+        if goal is None:
+            dx = 0.0
+            dy = 0.0
+            dist = 0.0
+            ang = 0.0
+        else:
+            dx = float(goal.point.x) - st["x"]
+            dy = float(goal.point.y) - st["y"]
+            dist = math.hypot(dx, dy)
+            ang = self._goal_angle_relative()
 
         cap = 6.0
         dx_n = float(np.clip(dx / cap, -1.0, 1.0))
@@ -814,7 +736,8 @@ class StretchRosEnv(gym.Env):
         r_goal = 0.0
         r_fail = 0.0
 
-        if d_goal <= self.goal_radius:
+        # Only treat as success if we actually have a goal
+        if self.ros.last_goal is not None and d_goal <= self.goal_radius:
             terminated = True
             r_goal = self.r_goal_terminal
 
@@ -1077,8 +1000,7 @@ def main():
     executor.add_node(ros)
 
     ros.get_logger().info(f"[CKPT] resolved_path={ckpt_path}")
-
-    use_curriculum = (GOAL_MODE.strip().lower() == "curriculum")
+    ros.get_logger().info(f"[GOAL] External goal expected on /{args.ns}/{args.goal_topic} (PointStamped)")
 
     env = StretchRosEnv(
         ros=ros,
@@ -1088,9 +1010,6 @@ def main():
         lidar_max_range=20.0,
         v_max=1.25,
         w_max=7.0,
-        use_curriculum=use_curriculum,
-        fixed_goal_x=FIXED_GOAL_X,
-        fixed_goal_y=FIXED_GOAL_Y,
         max_goal_radius_for_norm=6.0,
         goal_radius=GOAL_RADIUS,
         collision_dist=DEFAULT_COLLISION_DIST,

@@ -55,6 +55,11 @@ def generate_launch_description():
             "confidence_threshold": LaunchConfiguration("confidence_threshold"),
             "server_url": "http://localhost:8100",
             "prompt": "",  # Empty = use server's prompt
+            # Fast segmentation defaults (still SAM3 masks)
+            "mask_mode": "combined",
+            "mask_size": 256,
+            "resize_width": 640,
+            "jpeg_quality": 70,
             "enabled": True,
         }],
     )

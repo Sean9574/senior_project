@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SAM3 Webcam - Adjustable resolution"""
+"""SAM3 Webcam - Adjustable resolution (smooth mask rendering)"""
 
 import base64
 import threading
@@ -17,6 +17,7 @@ COLORS = [
     (255, 0, 255), (0, 255, 255), (128, 255, 0), (255, 128, 0),
 ]
 
+
 class SAM3Webcam:
     def __init__(self):
         self.cap = cv2.VideoCapture(4)
@@ -25,50 +26,81 @@ class SAM3Webcam:
         self.running = True
         self.lock = threading.Lock()
         self.inference_fps = 0
-        
+
         # Adjustable settings
         self.frame_width = 800
         self.confidence = 0.2
-        
+
+        # Smooth mask rendering settings
+        self.smooth_masks = True
+        self.smooth_sigma = 1.2        # higher = smoother edge (try 0.8–2.0)
+        self.alpha_strength = 0.60     # how strongly to overlay color (0..1)
+        self.contour_threshold = 0.50  # threshold on smoothed alpha for drawing contour (0..1)
+
+        # Small morphology to reduce jagged specks in contour (optional)
+        self.morph_kernel = 3          # 0 disables; else try 3 or 5
+
     def decode_mask(self, mask_b64):
         try:
             mask_bytes = base64.b64decode(mask_b64)
             mask_np = np.frombuffer(mask_bytes, np.uint8)
             mask = cv2.imdecode(mask_np, cv2.IMREAD_GRAYSCALE)
             return mask
-        except:
+        except Exception:
             return None
-    
+
     def overlay_masks(self, frame, masks_b64, boxes, scores, prompt):
         overlay = frame.copy()
         h, w = frame.shape[:2]
-        
+
         for i, (mask_b64, box, score) in enumerate(zip(masks_b64, boxes, scores)):
             mask = self.decode_mask(mask_b64)
             if mask is None:
                 continue
-            
-            mask = cv2.resize(mask, (w, h))
-            color = COLORS[i % len(COLORS)]
-            
-            mask_bool = mask > 127
-            overlay[mask_bool] = (
-                overlay[mask_bool] * 0.5 + np.array(color) * 0.5
-            ).astype(np.uint8)
-            
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(overlay, contours, -1, color, 2)
-            
+
+            # Resize mask to frame size (linear gives softer transitions than nearest)
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+
+            # Convert to alpha in [0,1] (this is what makes it LOOK smooth)
+            alpha = (mask.astype(np.float32) / 255.0)
+
+            # Optional blur to smooth edges further (visual smoothing)
+            if self.smooth_masks and self.smooth_sigma > 0:
+                alpha = cv2.GaussianBlur(alpha, (0, 0), self.smooth_sigma)
+
+            # Soft overlay: blend color using alpha (instead of a hard boolean cutoff)
+            color = np.array(COLORS[i % len(COLORS)], dtype=np.float32)
+
+            a = np.clip(alpha * float(self.alpha_strength), 0.0, 1.0)[..., None]  # (H,W,1)
+            overlay = (overlay.astype(np.float32) * (1.0 - a) + color[None, None, :] * a).astype(np.uint8)
+
+            # Draw a clean contour line (threshold the smoothed alpha)
+            contour_bin = (alpha >= float(self.contour_threshold)).astype(np.uint8) * 255
+
+            if self.morph_kernel and self.morph_kernel > 0:
+                k = int(self.morph_kernel)
+                k = k if (k % 2 == 1) else (k + 1)
+                kernel = np.ones((k, k), np.uint8)
+                contour_bin = cv2.morphologyEx(contour_bin, cv2.MORPH_OPEN, kernel, iterations=1)
+                contour_bin = cv2.morphologyEx(contour_bin, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+            contours, _ = cv2.findContours(contour_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay, contours, -1, COLORS[i % len(COLORS)], 2)
+
+            # Label + box
             x1, y1, x2, y2 = [int(v) for v in box]
             label = f"{prompt}: {score:.2f}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(overlay, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
-            cv2.putText(overlay, label, (x1 + 2, y1 - 5), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
+            cv2.rectangle(overlay, (x1, y1 - th - 8), (x1 + tw + 4, y1), COLORS[i % len(COLORS)], -1)
+            cv2.putText(
+                overlay, label, (x1 + 2, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
+            )
+
         return overlay
-        
+
     def capture_thread(self):
+        global FLIP_CAMERA
         while self.running:
             ret, frame = self.cap.read()
             if ret:
@@ -79,7 +111,7 @@ class SAM3Webcam:
                 with self.lock:
                     self.current_frame = small.copy()
             time.sleep(0.03)
-    
+
     def inference_thread(self):
         while self.running:
             with self.lock:
@@ -87,39 +119,41 @@ class SAM3Webcam:
                     continue
                 frame = self.current_frame.copy()
                 conf = self.confidence
-            
+
             try:
                 start = time.time()
-                
-                _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+
+                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                 img_b64 = base64.b64encode(buf).decode()
-                
-                r = requests.post(f"{SERVER}/segment",
+
+                r = requests.post(
+                    f"{SERVER}/segment",
                     json={"image_base64": img_b64, "confidence_threshold": conf},
-                    timeout=10)
-                
-                self.inference_fps = 1.0 / (time.time() - start)
-                
+                    timeout=10,
+                )
+
+                self.inference_fps = 1.0 / max(1e-6, (time.time() - start))
+
                 with self.lock:
                     self.result = r.json()
-                    
+
             except Exception as e:
                 print(f"Inference error: {e}")
-            
+
             time.sleep(0.01)
-    
+
     def run(self):
         threading.Thread(target=self.capture_thread, daemon=True).start()
         threading.Thread(target=self.inference_thread, daemon=True).start()
-        
+
         print("Controls:")
         print("  q - quit")
         print("  f - flip camera")
         print("  +/- - adjust resolution")
         print("  [/] - adjust confidence")
-        
+
         global FLIP_CAMERA
-        
+
         while self.running:
             with self.lock:
                 if self.current_frame is None:
@@ -127,47 +161,61 @@ class SAM3Webcam:
                 frame = self.current_frame.copy()
                 result = self.result.copy()
                 fps = self.inference_fps
-            
+
             prompt = result.get("prompt", "?")
             num = result.get("num_objects", 0)
             masks_b64 = result.get("masks_base64", [])
             boxes = result.get("boxes", [])
             scores = result.get("scores", [])
-            
+
             if masks_b64 and boxes:
                 display = self.overlay_masks(frame, masks_b64, boxes, scores, prompt)
             else:
                 display = frame
-            
-            # Info bar
-            cv2.putText(display, f"'{prompt}' | Found: {num} | {fps:.1f}Hz | Res:{self.frame_width} | Conf:{self.confidence:.2f}",
-                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-            cv2.putText(display, "q:quit f:flip +/-:res [/]:conf",
-                (10, display.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
-            
-            cv2.imshow("SAM3 Segmentation", display)
-            
+
+            cv2.putText(
+                display,
+                f"'{prompt}' | Found: {num} | {fps:.1f}Hz | Res:{self.frame_width} | Conf:{self.confidence:.2f}",
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+            )
+            cv2.putText(
+                display,
+                "q:quit f:flip +/-:res [/]:conf",
+                (10, display.shape[0] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.35,
+                (200, 200, 200),
+                1,
+            )
+
+            cv2.imshow("SAM3 Segmentation (Smooth)", display)
+
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            if key == ord("q"):
                 self.running = False
                 break
-            elif key == ord('f'):
+            elif key == ord("f"):
                 FLIP_CAMERA = not FLIP_CAMERA
-            elif key == ord('+') or key == ord('='):
+            elif key == ord("+") or key == ord("="):
                 self.frame_width = min(800, self.frame_width + 80)
                 print(f"Resolution: {self.frame_width}")
-            elif key == ord('-'):
+            elif key == ord("-"):
                 self.frame_width = max(240, self.frame_width - 80)
                 print(f"Resolution: {self.frame_width}")
-            elif key == ord(']'):
+            elif key == ord("]"):
                 self.confidence = min(0.9, self.confidence + 0.05)
                 print(f"Confidence: {self.confidence:.2f}")
-            elif key == ord('['):
+            elif key == ord("["):
                 self.confidence = max(0.05, self.confidence - 0.05)
                 print(f"Confidence: {self.confidence:.2f}")
-        
+
         self.cap.release()
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     SAM3Webcam().run()
