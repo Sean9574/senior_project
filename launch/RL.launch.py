@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 
+from ament_index_python.packages import get_package_share_directory
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
@@ -170,12 +171,12 @@ def generate_launch_description():
         )
     )
 
-    # --- Load URDF and rewrite mesh paths ---
+    # --- Load URDF and rewrite mesh paths (FIXED) ---
     robot_description_file = Path(
-        "/home/sean/ament_ws/src/stretch_ros2/stretch_description/urdf/stretch.urdf"
-    )
+        get_package_share_directory('stretch_description')
+    ) / 'urdf' / 'stretch.urdf'
 
-    mesh_root = "/home/sean/ament_ws/src/stretch_ros2/stretch_description"
+    mesh_root = get_package_share_directory('stretch_description')
 
     with open(robot_description_file, "r") as f:
         robot_description_content = f.read()
@@ -216,14 +217,14 @@ def generate_launch_description():
         )
     )
 
-    # RViz (launched normally)
+    # RViz (launched normally) - FIXED: removed hardcoded config path
     ld.add_action(
         Node(
             package="rviz2",
             executable="rviz2",
             name="rviz2",
             output="screen",
-            arguments=['-d', '/home/sean/.rviz2/stretch2.rviz'],
+            arguments=[],
             remappings=[
                 ("/move_base_simple/goal", "/goal"),
                 ("/goal_pose", "/goal")

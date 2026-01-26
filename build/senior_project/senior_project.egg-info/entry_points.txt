@@ -1,3 +1,8 @@
 [console_scripts]
-
+learner_node = senior_project.learner_node:main
+sam3_depth_node = senior_project.sam3_depth_node:main
+sam3_goal_generator = senior_project.sam3_goal_generator:main
+sam3_room_scanner = senior_project.sam3_room_scanner:main
+sam3_ros_node = senior_project.sam3_ros_node:main
+sam3_server = senior_project.sam3_server:main
 
